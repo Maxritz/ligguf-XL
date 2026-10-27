@@ -4,7 +4,11 @@
 
 #include <time.h>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "common.h"
+#include "breadcrumb.h"
 
 using namespace std;
 
@@ -41,9 +45,17 @@ void model_state::allocate()
 
 double tmsec()
 {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)freq.QuadPart * 1000.0;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC,&ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
 }
 
 string load_text_file(const char* fn)

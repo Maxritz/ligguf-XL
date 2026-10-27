@@ -5,6 +5,7 @@
 #include <map>
 #include "common.h"
 #include "tokenize.h"
+#include "breadcrumb.h"
 
 using namespace std;
 

@@ -3,8 +3,10 @@
  * */
 
 #include <assert.h>
+#include <string.h>
 #include "common.h"
 #include "lil_math.h"
+#include "breadcrumb.h"
 
 using namespace std;
 
@@ -265,6 +267,39 @@ void dequantize_row_q5_K(const block_q5_K* x, float* y, int64_t k)
     }
 }
 
+/* Q5_0/Q5_1 dequantizers */
+/* qh[4] is bit-packed: bit j of element j lives in qh[j>>3] >> (j&7) */
+void dequantize_row_q5_0(const block_q5_0* x, float* y, int64_t k)
+{
+    const int nb = k / QK8_0;
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32(x[i].d);
+        for (int j = 0; j < QK8_0; j++) {
+            const int l  = j / 2;
+            const int qs = (x[i].qs[l] >> ((j & 1) ? 4 : 0)) & 0xF;
+            const int qb = (x[i].qh[j >> 3] >> (j & 7)) & 1;
+            const int v  = qs | (qb << 4);
+            y[i*QK8_0 + j] = d * (float)(int8_t)v;
+        }
+    }
+}
+
+void dequantize_row_q5_1(const block_q5_1* x, float* y, int64_t k)
+{
+    const int nb = k / QK8_0;
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32(x[i].d);
+        const float m = fp16_to_fp32(x[i].m);
+        for (int j = 0; j < QK8_0; j++) {
+            const int l  = j / 2;
+            const int qs = (x[i].qs[l] >> ((j & 1) ? 4 : 0)) & 0xF;
+            const int qb = (x[i].qh[j >> 3] >> (j & 7)) & 1;
+            const int v  = qs | (qb << 4);
+            y[i*QK8_0 + j] = d * (float)v + m;
+        }
+    }
+}
+
 void dequantize_row_q6_K(const block_q6_K* x, float* y, int64_t k)
 {
     // Q6_K stores low 4 bits in ql[128], high 2 bits in qh[64], one signed scale
@@ -310,6 +345,8 @@ void dequantize_row(gguf_type t, const void* in, float* out, int64_t n)
     case Q4_K: dequantize_row_q4_K((block_q4_K*)in,out,n); break;
     case Q5_K: dequantize_row_q5_K((block_q5_K*)in,out,n); break;
     case Q6_K: dequantize_row_q6_K((block_q6_K*)in,out,n); break;
+    case Q5_0: dequantize_row_q5_0((const block_q5_0*)in,out,n); break;
+    case Q5_1: dequantize_row_q5_1((const block_q5_1*)in,out,n); break;
     default:
         ERR("Unsupported tensor type %d",t);
         abort();
@@ -357,15 +394,18 @@ static inline int nearest_int(float f)
 
 void quantize_q8_K(ktensor &y, const ftensor &x)
 {
-    assert(x.size() % QK_K == 0);
-    const int nb = x.size() / QK_K;
+    const int n = x.size();
+    const int nb = (n + QK_K - 1) / QK_K;   /* round up to cover remainders */
+
+    if ((int)y.size() < nb) y.resize(nb);
 
     MULTITHREAD
     for (int i = 0; i < nb; i++) {
         const float* p = x.data() + i * QK_K;
+        int ncur = (i == nb - 1) ? (n - i * QK_K) : QK_K;
         float max = 0.0f;
         float amax = 0.0f;
-        for (int j = 0; j < QK_K; j++) {
+        for (int j = 0; j < ncur; j++) {
             float ax = fabsf(p[j]);
             if (ax > amax) {
                 amax = ax;
@@ -380,13 +420,15 @@ void quantize_q8_K(ktensor &y, const ftensor &x)
         }
 
         const float iscale = -127.0f / max;
-        for (int j = 0; j < QK_K; j++) {
+        memset(y[i].qs, 0, QK_K);  /* zero-pad remainder */
+        for (int j = 0; j < ncur; j++) {
             int v = nearest_int(iscale * p[j]);
-            y[i].qs[j] = min(127,v);
+            y[i].qs[j] = min(127, max(-128, v));
         }
         for (int j = 0; j < QK_K/16; j++) {
             int sum = 0;
-            for (int ii = 0; ii < 16; ii++) sum += y[i].qs[j*16 + ii];
+            int jmax = (j+1)*16 <= ncur ? 16 : (ncur - j*16);
+            for (int ii = 0; ii < jmax; ii++) sum += (int)y[i].qs[j*16 + ii];
             y[i].bsums[j] = sum;
         }
         y[i].d = 1.0f / iscale;
@@ -747,8 +789,9 @@ float inline dot_q8_K_q6_K(const block_q8_K* y, const block_q6_K* x, int n)
 // n: input width, d: output width
 void matmul(ftensor &out, const ftensor* src, const ktensor* qxk, const qtensor* qx8, wtensor w, int n, int d)
 {
+    STRACE_MATMUL("matmul", n, d);
     const block_q8_0* q8 = qx8 ? qx8->data() : NULL;
-    if ((w.type == Q8_0 || w.type == Q1_0 || w.type == Q1_G) && !q8) {
+    if ((w.type == Q8_0 || w.type == Q1_0 || w.type == Q1_G || w.type == Q5_0 || w.type == Q5_1) && !q8) {
         assert(src);
         quantize_q8_0(m_xq8,*src);
         q8 = m_xq8.data();
@@ -768,6 +811,8 @@ void matmul(ftensor &out, const ftensor* src, const ktensor* qxk, const qtensor*
             case Q4_K: out[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp,n); break;
             case Q5_K: out[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp,n); break;
             case Q6_K: out[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp,n); break;
+            case Q5_0: out[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp,n); break;
+            case Q5_1: out[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp,n); break;
             default:
                 ERR("Unsupported matmul type %d",w.type);
                 abort();
@@ -779,7 +824,7 @@ void matmul(ftensor &out, const ftensor* src, const ktensor* qxk, const qtensor*
 void matmul2(ftensor &out0, ftensor &out1, const ftensor* src, const ktensor* qxk, const qtensor* qx8, wtensor w0, wtensor w1, int n, int d)
 {
     const block_q8_0* q8 = qx8 ? qx8->data() : NULL;
-    if ((w0.type == Q8_0 || w0.type == Q1_0 || w0.type == Q1_G || w1.type == Q8_0 || w1.type == Q1_0 || w1.type == Q1_G) && !q8) {
+    if ((w0.type == Q8_0 || w0.type == Q1_0 || w0.type == Q1_G || w0.type == Q5_0 || w0.type == Q5_1 || w1.type == Q8_0 || w1.type == Q1_0 || w1.type == Q1_G || w1.type == Q5_0 || w1.type == Q5_1) && !q8) {
         assert(src);
         quantize_q8_0(m_xq8,*src);
         q8 = m_xq8.data();
@@ -801,6 +846,8 @@ void matmul2(ftensor &out0, ftensor &out1, const ftensor* src, const ktensor* qx
             case Q4_K: out0[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp0,n); break;
             case Q5_K: out0[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp0,n); break;
             case Q6_K: out0[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp0,n); break;
+            case Q5_0: out0[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp0,n); break;
+            case Q5_1: out0[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp0,n); break;
             default:
                 ERR("Unsupported matmul type %d",w0.type);
                 abort();
@@ -817,6 +864,8 @@ void matmul2(ftensor &out0, ftensor &out1, const ftensor* src, const ktensor* qx
             case Q4_K: out1[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp1,n); break;
             case Q5_K: out1[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp1,n); break;
             case Q6_K: out1[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp1,n); break;
+            case Q5_0: out1[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp1,n); break;
+            case Q5_1: out1[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp1,n); break;
             default:
                 ERR("Unsupported matmul type %d",w1.type);
                 abort();
@@ -827,7 +876,7 @@ void matmul2(ftensor &out0, ftensor &out1, const ftensor* src, const ktensor* qx
 void matmul3(ftensor &out0, ftensor &out1, ftensor &out2, const ftensor* src, const ktensor* qxk, const qtensor* qx8, wtensor w0, wtensor w1, wtensor w2, int n, int d0, int d1, int d2)
 {
     const block_q8_0* q8 = qx8 ? qx8->data() : NULL;
-    if ((w0.type == Q8_0 || w0.type == Q1_0 || w0.type == Q1_G || w1.type == Q8_0 || w1.type == Q1_0 || w1.type == Q1_G || w2.type == Q8_0 || w2.type == Q1_0 || w2.type == Q1_G) && !q8) {
+    if ((w0.type == Q8_0 || w0.type == Q1_0 || w0.type == Q1_G || w0.type == Q5_0 || w0.type == Q5_1 || w1.type == Q8_0 || w1.type == Q1_0 || w1.type == Q1_G || w1.type == Q5_0 || w1.type == Q5_1 || w2.type == Q8_0 || w2.type == Q1_0 || w2.type == Q1_G || w2.type == Q5_0 || w2.type == Q5_1) && !q8) {
         assert(src);
         quantize_q8_0(m_xq8,*src);
         q8 = m_xq8.data();
@@ -852,6 +901,8 @@ void matmul3(ftensor &out0, ftensor &out1, ftensor &out2, const ftensor* src, co
                 case Q4_K: out0[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp0,n); break;
                 case Q5_K: out0[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp0,n); break;
                 case Q6_K: out0[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp0,n); break;
+                case Q5_0: out0[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp0,n); break;
+                case Q5_1: out0[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp0,n); break;
                 default:
                     ERR("Unsupported matmul type %d",w0.type);
                     abort();
@@ -871,6 +922,8 @@ void matmul3(ftensor &out0, ftensor &out1, ftensor &out2, const ftensor* src, co
                 case Q4_K: out1[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp1,n); break;
                 case Q5_K: out1[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp1,n); break;
                 case Q6_K: out1[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp1,n); break;
+                case Q5_0: out1[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp1,n); break;
+                case Q5_1: out1[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp1,n); break;
                 default:
                     ERR("Unsupported matmul type %d",w1.type);
                     abort();
@@ -890,6 +943,8 @@ void matmul3(ftensor &out0, ftensor &out1, ftensor &out2, const ftensor* src, co
                 case Q4_K: out2[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp2,n); break;
                 case Q5_K: out2[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp2,n); break;
                 case Q6_K: out2[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp2,n); break;
+                case Q5_0: out2[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp2,n); break;
+                case Q5_1: out2[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp2,n); break;
                 default:
                     ERR("Unsupported matmul type %d",w2.type);
                     abort();

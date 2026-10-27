@@ -10,6 +10,7 @@
 #include "common.h"
 #include "tokenize.h"
 #include "viz_sdl.h"
+#include "breadcrumb.h"
 
 struct viz_state {
     SDL_Window* win;
@@ -229,7 +230,7 @@ void viz_present(int tok)
     while (g_viz.paused && g_viz.ready) {
         viz_pump();
         blit_frame();
-        usleep(60000);
+        usleep_wrap(60000);
     }
     if (!g_viz.ready) return;
 

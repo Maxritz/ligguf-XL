@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include "platform.h"
 #include "common.h"
 #include "lil_math.h"
 #include "vdb.h"

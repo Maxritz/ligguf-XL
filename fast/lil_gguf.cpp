@@ -3,10 +3,8 @@
  * */
 
 #include <assert.h>
-#include <fcntl.h>
 #include <time.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include "platform.h"
 #include "common.h"
 #include "lil_gguf.h"
 
@@ -170,7 +168,7 @@ static uint64_t skipper(gguf_val_type t, uint8_t* pos)
 
 static inline bool supported_qweight(gguf_type t)
 {
-    return t == Q8_0 || t == Q1_0 || t == Q1_G || t == Q2_K || t == Q3_K || t == Q4_K || t == Q5_K || t == Q6_K;
+    return t == Q8_0 || t == Q1_0 || t == Q1_G || t == Q2_K || t == Q3_K || t == Q4_K || t == Q5_K || t == Q6_K || t == Q5_0 || t == Q5_1;
 }
 
 static inline bool supported_rowweight(gguf_type t)
@@ -218,6 +216,12 @@ uint64_t row_size(gguf_type type, int len)
         case Q6_K:
             assert(len % QK_K == 0);
             return sizeof(block_q6_K) * (len / QK_K);
+        case Q5_0:
+            assert(len % QK8_0 == 0);
+            return sizeof(block_q5_0) * (len / QK8_0);
+        case Q5_1:
+            assert(len % QK8_0 == 0);
+            return sizeof(block_q5_1) * (len / QK8_0);
         default:
             ERR("Unsupported row type %d",type);
             abort();
@@ -228,21 +232,15 @@ bool gguf_model::open_mmap(const char* fn)
 {
     fsize = 0;
     base = NULL;
-    file = open(fn,O_RDONLY);
-    if (file == -1) {
+    HANDLE hFile = open_wrap(fn);
+    file = (intptr_t)hFile;
+    if (file == (intptr_t)-1) {
         ERR("Can't open file %s",fn);
         return false;
     }
 
-    struct stat st;
-    if (fstat(file,&st)) {
-        ERR("Can't stat file %s",fn);
-        close_mmap();
-        return false;
-    }
-
-    fsize = st.st_size;
-    base = (uint8_t*)mmap(NULL,fsize,PROT_READ,MAP_SHARED,file,0);
+    fsize = file_size_wrap(hFile);
+    base = (uint8_t*)mmap_wrap(hFile, fsize);
     if (base == MAP_FAILED) {
         ERR("Can't mmap() file %s",fn);
         close_mmap();
@@ -254,8 +252,8 @@ bool gguf_model::open_mmap(const char* fn)
 
 void gguf_model::close_mmap()
 {
-    if (base && base != MAP_FAILED && fsize) munmap(base, fsize);
-    if (file != -1) close(file);
+    if (base && base != MAP_FAILED && fsize) munmap_wrap(base, fsize);
+    if (file != (intptr_t)-1) close_wrap((HANDLE)file);
     base = NULL;
     fsize = 0;
     file = -1;
@@ -278,7 +276,7 @@ bool gguf_model::read_tokenizer()
     uint64_t ne = rd64(&pos);
     if (!vocab_size) vocab_size = ne;
     if ((int)ne != vocab_size) {
-        ERR("Unexpected number of tokens %lu",ne);
+        ERR("Unexpected number of tokens %I64u", (unsigned __int64)ne);
         return false;
     }
     tokens.resize(ne);
@@ -343,13 +341,13 @@ bool gguf_model::read_gguf()
 
     uint64_t nten = rd64(&p);
     if (!nten || nten > MAXTENSORS) {
-        ERR("Suspicious number of tensors: %lu",nten);
+        ERR("Suspicious number of tensors: %I64u", (unsigned __int64)nten);
         return false;
     }
 
     uint64_t meta = rd64(&p);
     if (!meta || meta > MAXMETAKV) {
-        ERR("Suspicious number of KV pairs: %lu",meta);
+        ERR("Suspicious number of KV pairs: %I64u", (unsigned __int64)meta);
         return false;
     }
 
@@ -387,7 +385,7 @@ bool gguf_model::read_gguf()
     tok_mask = meta_kv.count(TOKENS_MASK_KEY)? kvrd32(TOKENS_MASK_KEY) : 0;
 
     if (arch == "llama") return read_llama();
-    else if (arch == "qwen3") return read_qwen3();
+    else if (arch == "qwen3" || arch == "qwen35") return read_qwen3();
     else if (arch == "bert") return read_bert();
 
     ERR("Unsupported architecture '%s'",arch.c_str());
@@ -403,7 +401,7 @@ bool gguf_model::read_llama()
     n_kv_heads = kvrd32(HEAD_KV_COUNT_KEY);
     n_context = kvrd32(CONTEXT_LEN_KEY);
     rms_epsilon = kvrdf32(RMS_EPSILON_KEY);
-    rope_base = kvrdf32(ROPE_BASE_KEY);
+    rope_base = meta_kv.count(ROPE_BASE_KEY)? kvrdf32(ROPE_BASE_KEY) : 10000.0f;
     rope_dim = kvrd32(ROPE_DIMS_KEY);
     n_ff = kvrd32(FF_LEN_KEY);
 
@@ -443,20 +441,20 @@ bool gguf_model::read_llama()
 
 bool gguf_model::read_qwen3()
 {
-    n_layers = kvrd32(QWEN3_BLOCK_COUNT_KEY);
-    n_embed = kvrd32(QWEN3_EMBED_LEN_KEY);
-    n_heads = kvrd32(QWEN3_HEAD_COUNT_KEY);
-    n_kv_heads = kvrd32(QWEN3_HEAD_KV_COUNT_KEY);
-    n_context = kvrd32(QWEN3_CONTEXT_LEN_KEY);
-    rms_epsilon = kvrdf32(QWEN3_RMS_EPSILON_KEY);
-    rope_base = kvrdf32(QWEN3_ROPE_BASE_KEY);
-    rope_scaling = meta_kv.count(QWEN3_ROPE_SCALING_TYPE_KEY)? kvrdstr(QWEN3_ROPE_SCALING_TYPE_KEY) : "";
-    rope_scale = meta_kv.count(QWEN3_ROPE_SCALING_FACTOR_KEY)? kvrdf32(QWEN3_ROPE_SCALING_FACTOR_KEY) : 1.0f;
-    rope_orig_context = meta_kv.count(QWEN3_ROPE_SCALING_ORIG_CTX_KEY)? kvrd32(QWEN3_ROPE_SCALING_ORIG_CTX_KEY) : 0;
-    head_dim = kvrd32(QWEN3_KEY_LEN_KEY);
+    n_layers = kvrd32(meta_kv.count(QWEN3_BLOCK_COUNT_KEY)? QWEN3_BLOCK_COUNT_KEY : "qwen35.block_count");
+    n_embed = kvrd32(meta_kv.count(QWEN3_EMBED_LEN_KEY)? QWEN3_EMBED_LEN_KEY : "qwen35.embedding_length");
+    n_heads = kvrd32(meta_kv.count(QWEN3_HEAD_COUNT_KEY)? QWEN3_HEAD_COUNT_KEY : "qwen35.attention.head_count");
+    n_kv_heads = kvrd32(meta_kv.count(QWEN3_HEAD_KV_COUNT_KEY)? QWEN3_HEAD_KV_COUNT_KEY : "qwen35.attention.head_count_kv");
+    n_context = kvrd32(meta_kv.count(QWEN3_CONTEXT_LEN_KEY)? QWEN3_CONTEXT_LEN_KEY : "qwen35.context_length");
+    rms_epsilon = kvrdf32(meta_kv.count(QWEN3_RMS_EPSILON_KEY)? QWEN3_RMS_EPSILON_KEY : "qwen35.attention.layer_norm_rms_epsilon");
+    rope_base = kvrdf32(meta_kv.count(QWEN3_ROPE_BASE_KEY)? QWEN3_ROPE_BASE_KEY : "qwen35.rope.freq_base");
+    rope_scaling = meta_kv.count(QWEN3_ROPE_SCALING_TYPE_KEY)? kvrdstr(QWEN3_ROPE_SCALING_TYPE_KEY) : (meta_kv.count("qwen35.rope.scaling.type")? kvrdstr("qwen35.rope.scaling.type") : "");
+    rope_scale = meta_kv.count(QWEN3_ROPE_SCALING_FACTOR_KEY)? kvrdf32(QWEN3_ROPE_SCALING_FACTOR_KEY) : (meta_kv.count("qwen35.rope.scaling.factor")? kvrdf32("qwen35.rope.scaling.factor") : 1.0f);
+    rope_orig_context = meta_kv.count(QWEN3_ROPE_SCALING_ORIG_CTX_KEY)? kvrd32(QWEN3_ROPE_SCALING_ORIG_CTX_KEY) : (meta_kv.count("qwen35.rope.scaling.original_context_length")? kvrd32("qwen35.rope.scaling.original_context_length") : 0);
+    head_dim = meta_kv.count(QWEN3_KEY_LEN_KEY)? kvrd32(QWEN3_KEY_LEN_KEY) : (meta_kv.count("qwen35.attention.key_length")? kvrd32("qwen35.attention.key_length") : n_embed / n_heads);
     rope_dim = head_dim;
-    n_ff = kvrd32(QWEN3_FF_LEN_KEY);
-    int value_dim = kvrd32(QWEN3_VALUE_LEN_KEY);
+    n_ff = kvrd32(meta_kv.count(QWEN3_FF_LEN_KEY)? QWEN3_FF_LEN_KEY : "qwen35.feed_forward_length");
+    int value_dim = kvrd32(meta_kv.count(QWEN3_VALUE_LEN_KEY)? QWEN3_VALUE_LEN_KEY : "qwen35.attention.value_length");
     kv_dim = n_kv_heads * value_dim;
     vocab_size = 0;
 

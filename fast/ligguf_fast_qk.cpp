@@ -7,12 +7,13 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
-#include <unistd.h>
 #include <assert.h>
 #include <time.h>
+#include "platform.h"
 #include "common.h"
 #include "lil_gguf.h"
 #include "lil_math.h"
+#include "breadcrumb.h"
 #include "tokenize.h"
 #include "vdb.h"
 #include "viz_sdl.h"
@@ -23,6 +24,7 @@ model_state g_m;
 
 void inference(int tok)
 {
+    PERF_INFERENCE();
     const float att_scale = 1.0f / sqrtf(g_m.m.head_dim);
     const int pos = g_m.pos++;
 
@@ -33,11 +35,13 @@ void inference(int tok)
     viz_trace_column(0,g_m.x.data(),g_m.m.n_embed);
 
     for (int l = 0; l < g_m.m.n_layers; l++) {
+        STRACE_INFER(l);
         // Attention branch: RMSNorm, QKV projections, RoPE on Q/K, cache the new KV, then mix values with attention weights.
         rmsnorm(g_m.xb,g_m.x,g_m.m.tr[l].att_norm,g_m.m.n_embed,g_m.m.rms_epsilon);
 
-        quantize_q8_K(g_m.xq,g_m.xb);
-        matmul3(g_m.q,g_m.k,g_m.v,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].att_q,g_m.m.tr[l].att_k,g_m.m.tr[l].att_v,g_m.m.n_embed,g_m.m.n_embed,g_m.m.kv_dim,g_m.m.kv_dim); // Q, K & V
+    quantize_q8_K(g_m.xq,g_m.xb);
+    STRACE_MATMUL("qkv_proj", g_m.m.n_embed, g_m.m.n_embed + g_m.m.kv_dim * 2);
+    matmul3(g_m.q,g_m.k,g_m.v,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].att_q,g_m.m.tr[l].att_k,g_m.m.tr[l].att_v,g_m.m.n_embed,g_m.m.n_embed,g_m.m.kv_dim,g_m.m.kv_dim); // Q, K & V
 
         if (g_m.m.arch == "qwen3") {
             // RMSnorm for current Query and Key
@@ -65,6 +69,7 @@ void inference(int tok)
 
         MULTITHREAD
         for (int h = 0; h < g_m.m.n_heads; h++) {
+            STRACE_ATTN(l, h);
             float* att = g_m.att.data() + (h * g_m.m.n_context); // attention scores for this head
             float* q = g_m.q.data() + (h * g_m.m.head_dim); // start of the Q vector
             float* k = g_m.k.data() + (h / nrep) * g_m.m.head_dim;
@@ -110,6 +115,7 @@ void inference(int tok)
         viz_trace_column(1 + l * 2,g_m.xb2.data(),g_m.m.n_embed);
         for (int j = 0; j < g_m.m.n_embed; j++) g_m.x[j] += g_m.xb2[j];
 
+        STRACE_FFN(l);
         // FFN branch: run up/gate together, apply SwiGLU, project down, then add the residual.
         rmsnorm(g_m.xb,g_m.x,g_m.m.tr[l].ffn_norm,g_m.m.n_embed,g_m.m.rms_epsilon);
 
@@ -367,6 +373,7 @@ static void stats()
 
 void generate()
 {
+    PERF_GENERATE();
     feed_text(g_m.prompt,true,true);
 
     int ng = g_m.n_gen? g_m.n_gen : g_m.m.n_context;
@@ -569,10 +576,16 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    PERF_MODEL_LOAD();
     assert(g_m.m.open_mmap(g_m.model_fn.c_str()));
     assert(g_m.m.read_gguf());
+    PERF_MODEL_LOAD_END();
+    STRACE_MODEL(g_m.m.arch.c_str());
     g_m.allocate();
+    PERF_TOKENIZE();
     assert(g_m.m.read_tokenizer());
+    PERF_TOKENIZE_END();
+    STRACE_TOKENIZER(g_m.m.vocab_size);
 
     if (!g_m.load_state.empty() && !load_model_state(g_m.load_state.c_str())) return 2;
 

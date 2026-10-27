@@ -157,6 +157,94 @@ float inline dot_q8_0_q1_G(const block_q8_0* y, const block_q1_G* x, int n)
     return hsum_float_8(acc);
 }
 
+/* ── Q5_0 / Q5_1 dot products (no dequant, direct SIMD) ──────────────────── */
+/* qh[4] is bit-packed: bit j lives in byte j>>3, position j&7                 */
+
+static inline __m256i q5_expand_qh_to_bytes(const uint8_t* qh4)
+{
+    uint32_t qh32 = (uint32_t)qh4[0] | ((uint32_t)qh4[1] << 8) |
+                    ((uint32_t)qh4[2] << 16) | ((uint32_t)qh4[3] << 24);
+    uint8_t tmp[32];
+    for (int j = 0; j < 32; j++) tmp[j] = (qh32 >> j) & 1;
+    return _mm256_loadu_si256((const __m256i*)tmp);
+}
+
+float inline dot_q8_0_q5_0(const block_q8_0* y, const block_q5_0* x, int n)
+{
+    const int nb = n / QK8_0;
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+
+        __m256i q8 = _mm256_loadu_si256((const __m256i*)y[i].qs);
+
+        /* Expand qs[16] → 32 uint8 (lower 4 bits per element, 0-15) */
+        __m128i qs128 = _mm_loadu_si128((const __m128i*)x[i].qs);
+        __m128i qs_lo = _mm_and_si128(qs128, _mm_set1_epi8(0x0F));
+        __m128i qs_hi = _mm_and_si128(_mm_srli_epi16(qs128, 4), _mm_set1_epi8(0x0F));
+        __m256i qs = _mm256_castsi128_si256(_mm_unpacklo_epi8(qs_lo, qs_hi));
+        qs = _mm256_inserti128_si256(qs, _mm_unpackhi_epi8(qs_lo, qs_hi), 1);
+
+        /* Expand qh[4] → 32 uint8 (0 or 1) */
+        __m256i qh = q5_expand_qh_to_bytes(x[i].qh);
+
+        /* v = qs | (qh << 4) → unsigned 0-31 */
+        /* (int8_t)v = qs - 16*qh → signed -16..15 */
+        __m256i qh16 = _mm256_and_si256(qh, _mm256_set1_epi8(0x10));
+        __m256i q5 = _mm256_sub_epi8(qs, qh16);  /* signed int8 */
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d),
+                              mul_sum_i8_pairs_float(q5, q8), acc);
+    }
+
+    return hsum_float_8(acc);
+}
+
+float inline dot_q8_0_q5_1(const block_q8_0* y, const block_q5_1* x, int n)
+{
+    const int nb = n / QK8_0;
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d  = fp16_to_fp32(x[i].d)  * fp16_to_fp32(y[i].d);
+        const float dm = fp16_to_fp32(x[i].m);
+
+        __m256i q8 = _mm256_loadu_si256((const __m256i*)y[i].qs);
+
+        /* Expand qs[16] → 32 uint8 (lower 4 bits, 0-15) */
+        __m128i qs128 = _mm_loadu_si128((const __m128i*)x[i].qs);
+        __m128i qs_lo = _mm_and_si128(qs128, _mm_set1_epi8(0x0F));
+        __m128i qs_hi = _mm_and_si128(_mm_srli_epi16(qs128, 4), _mm_set1_epi8(0x0F));
+        __m256i qs = _mm256_castsi128_si256(_mm_unpacklo_epi8(qs_lo, qs_hi));
+        qs = _mm256_inserti128_si256(qs, _mm_unpackhi_epi8(qs_lo, qs_hi), 1);
+
+        /* Expand qh[4] → 32 uint8 (0 or 1) */
+        __m256i qh = q5_expand_qh_to_bytes(x[i].qh);
+
+        /* Q5_1: v is unsigned (0-31), result = d * v + m */
+        __m256i qh16 = _mm256_and_si256(qh, _mm256_set1_epi8(0x10));
+        __m256i q5 = _mm256_or_si256(qs, qh16);  /* unsigned 0-31 */
+
+        /* v * q8 using maddubs (unsigned × signed → int16 pairs) */
+        __m256i prod = _mm256_maddubs_epi16(q5, q8);  /* 16 × int16 */
+        __m256i sum32 = _mm256_madd_epi16(prod, _mm256_set1_epi16(1));  /* 8 × int32 */
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sum32), acc);
+
+        /* Min term: m * sum(q8) */
+        __m128i q8_lo128 = _mm256_extracti128_si256(q8, 0);
+        __m128i q8_hi128 = _mm256_extracti128_si256(q8, 1);
+        __m128i s_lo = _mm_madd_epi16(_mm_cvtepi8_epi16(q8_lo128), _mm_set1_epi16(1));
+        __m128i s_hi = _mm_madd_epi16(_mm_cvtepi8_epi16(q8_hi128), _mm_set1_epi16(1));
+        __m128i s = _mm_add_epi32(s_lo, s_hi);
+        s = _mm_hadd_epi32(s, s);
+        float q8_sum = (float)_mm_cvtsi128_si32(_mm_hadd_epi32(s, s));
+        acc = _mm256_add_ps(acc, _mm256_set1_ps(dm * q8_sum));
+    }
+
+    return hsum_float_8(acc);
+}
+
 float inline dot_q8_K_q2_K(const block_q8_K* y, const block_q2_K* x, int n)
 {
     const int nb = n / QK_K;

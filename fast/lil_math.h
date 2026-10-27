@@ -13,6 +13,8 @@ void fp1632_init();
 void dequantize_row_q8_0(const block_q8_0* x, float* y, int64_t k);
 void dequantize_row_q1_0(const block_q1_0* x, float* y, int64_t k);
 void dequantize_row_q1_G(const block_q1_G* x, float* y, int64_t k);
+void dequantize_row_q5_0(const block_q5_0* x, float* y, int64_t k);
+void dequantize_row_q5_1(const block_q5_1* x, float* y, int64_t k);
 void dequantize_row_q2_K(const block_q2_K* x, float* y, int64_t k);
 void dequantize_row_q3_K(const block_q3_K* x, float* y, int64_t k);
 void dequantize_row_q4_K(const block_q4_K* x, float* y, int64_t k);

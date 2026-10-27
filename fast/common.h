@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include "platform.h"
 #include "lil_gguf.h"
 
 #define VERSION "0.5.2"
@@ -28,7 +29,7 @@ struct model_file {
     int n_context;
     uint64_t kv_size;
     uint64_t logits_size;
-} __attribute((packed));
+};
 
 struct model_state {
     std::string model_fn; // model file name

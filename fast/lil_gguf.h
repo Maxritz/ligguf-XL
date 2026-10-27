@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
-#include <unistd.h>
+#include "platform.h"
 #include <vector>
 #include <string>
 #include <map>
@@ -112,6 +112,20 @@ struct block_q6_K {
     gguf_half d;
 };
 
+/* Q5_0/Q5_1 blocks (from GGUF spec: QK8_0=32 per block) */
+struct block_q5_0 {
+    gguf_half d;
+    uint8_t qh[QK8_0/8];   /* high bit for each of 32 values (bit-packed) */
+    uint8_t qs[QK8_0/2];   /* lower 4 bits for each of 32 values (nibble-packed) */
+};
+
+struct block_q5_1 {
+    gguf_half d;
+    gguf_half m;           /* per-block min */
+    uint8_t qh[QK8_0/8];
+    uint8_t qs[QK8_0/2];
+};
+
 struct block_q8_K {
     float d;
     int8_t qs[QK_K];
@@ -159,7 +173,7 @@ struct bert_block {
 };
 
 struct gguf_model {
-    int file = -1; // model file handle
+    intptr_t file = -1; // model file handle
     uint8_t* base = NULL; // base mmap address
     uint64_t fsize = 0; // model file size
     uint8_t* tensors_off = NULL; // aligned offset of the start of tensors block
