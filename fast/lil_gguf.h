@@ -276,6 +276,7 @@ struct trans_block {
     wtensor ffn_down;
     wtensor ffn_gate;
     bool ffn_up_fused = false; // Phi-3/Phi-4: gate+up share one [n_embed, 2*n_ff] tensor
+    float rope_attn = 1.0f;    // per-layer cos/sin scale (YaRN attn factor on full-attn layers)
 
     /* GPT-2: LayerNorm and projection biases. RMSNorm architectures leave these
      * null because every projection is bias-free. */
@@ -339,6 +340,18 @@ struct gguf_model {
     std::string rope_scaling;
     float rope_scale = 1.0f;
     int rope_orig_context = 0;
+
+    /* YaRN rope (mellum): a per-dimension blend of the interpolated and
+     * extrapolated frequency, plus a cos/sin scale. Full-attention layers use
+     * YaRN, sliding-window layers use plain rope at the SWA base frequency. */
+    bool  has_rope_yarn = false;
+    float rope_freq_scale = 1.0f;    // 1 / rope.scaling.factor
+    float rope_yarn_attn = 1.0f;     // yarn_attn_factor from the checkpoint
+    float rope_beta_fast = 32.0f;
+    float rope_beta_slow = 1.0f;
+    int   n_swa = 0;                 // sliding-window size, 0 = full attention
+    ftensor rope_freq_yarn;          // frequency table with the YaRN ramp folded in
+    std::vector<char> is_swa;        // per layer: 1 = sliding-window rope
     int n_ff; // feed-forward hidden size
     bool ffn_up_fused = false; // any layer keeps gate+up fused in ffn_up
     int kv_dim; // total K/V width across KV heads

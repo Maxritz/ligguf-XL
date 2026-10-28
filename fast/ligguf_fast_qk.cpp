@@ -188,7 +188,7 @@ void inference(int tok)
         if (g_m.m.tr[l].att_k_bias) for (int i = 0; i < g_m.m.kv_dim;  i++) g_m.k[i] += g_m.m.tr[l].att_k_bias[i];
         if (g_m.m.tr[l].att_v_bias) for (int i = 0; i < g_m.m.kv_dim;  i++) g_m.v[i] += g_m.m.tr[l].att_v_bias[i];
 
-        if (g_m.m.arch == "qwen3" || g_m.m.arch == "qwen35" || g_m.m.arch == "qwen3.5" || g_m.m.arch == "qwen3.8") {
+        if (g_m.m.tr[l].att_q_norm && g_m.m.tr[l].att_k_norm) {
             // RMSnorm for current Query and Key
             float* p = g_m.q.data();
             for (int h = 0; h < g_m.m.n_heads; h++, p += g_m.m.head_dim)
@@ -207,9 +207,20 @@ void inference(int tok)
             }
         }
 
-        // RoPE Q & K (float vectors)
-        rope(g_m.q,g_m.m.n_heads,pos,g_m.m,g_m.rope_freq);
-        rope(g_m.k,g_m.m.n_kv_heads,pos,g_m.m,g_m.rope_freq);
+        // RoPE Q & K (float vectors). YaRN full-attention layers use the ramped
+        // frequency table and the yarn attention factor; sliding-window layers
+        // use plain rope at the SWA base frequency.
+        const bool swa_layer = g_m.m.n_swa > 0 && (int)g_m.m.is_swa.size() == g_m.m.n_layers && g_m.m.is_swa[l];
+        const ftensor& rf = (g_m.m.has_rope_yarn && !swa_layer) ? g_m.m.rope_freq_yarn : g_m.rope_freq;
+        rope(g_m.q,g_m.m.n_heads,pos,g_m.m,rf);
+        rope(g_m.k,g_m.m.n_kv_heads,pos,g_m.m,rf);
+        if (g_m.m.tr[l].rope_attn != 1.0f) {
+            const float ra = g_m.m.tr[l].rope_attn;
+            float* qp = g_m.q.data();
+            for (int i = 0; i < g_m.m.n_heads * g_m.m.head_dim; i++) qp[i] *= ra;
+            float* kp = g_m.k.data();
+            for (int i = 0; i < g_m.m.kv_dim; i++) kp[i] *= ra;
+        }
 
         // Simple KV cache
         size_t loff = (size_t)l * g_m.m.n_context * g_m.m.kv_dim; // kv cache layer offset
@@ -228,8 +239,11 @@ void inference(int tok)
             float* k = g_m.k.data() + (h / nrep) * g_m.m.head_dim;
             float* v = g_m.v.data() + (h / nrep) * g_m.m.head_dim;
 
-            // Iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
+            // Sliding-window layers only see the last n_swa positions.
+            const int t0 = swa_layer && pos - g_m.m.n_swa + 1 > 0 ? pos - g_m.m.n_swa + 1 : 0;
+
+            // Iterate over the visible timesteps, including the current one
+            for (int t = t0; t <= pos; t++) {
                 // calculate the attention score as the dot product of q and k
                 float score;
                 if (t == pos) {
@@ -246,14 +260,14 @@ void inference(int tok)
             }
 
             // Turn attention scores over the visible prefix into normalized weights.
-            softmax(att,pos+1);
+            softmax(att + t0,pos - t0 + 1);
 
             // Weighted sum of the values
             float* xb = g_m.xb.data() + (h * g_m.m.head_dim);
             memset(xb,0,g_m.m.head_dim * sizeof(float));
 
             // Accumulate the weighted sum of cached values for this head.
-            for (int t = 0; t <= pos; t++) {
+            for (int t = t0; t <= pos; t++) {
                 float a = att[t];
                 if (t == pos) {
                     for (int i = 0; i < g_m.m.head_dim; i++) xb[i] += a * v[i];

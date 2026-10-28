@@ -419,7 +419,7 @@ bool gguf_model::read_gguf()
     tok_mask = meta_kv.count(TOKENS_MASK_KEY)? kvrd32(TOKENS_MASK_KEY) : 0;
 
     if (arch == "llama" || arch == "qwen" || arch == "qwen2" || arch == "qwen2.5" ||
-        arch == "qwen2moe" || arch == "phi3") return read_llama();
+        arch == "qwen2moe" || arch == "phi3" || arch == "mellum") return read_llama();
     else if (arch == "qwen3" || arch == "qwen35" || arch == "qwen3.5" || arch == "qwen3.8") return read_qwen3();
     else if (arch == "gpt2") return read_gpt2();
     else if (arch == "bert") return read_bert();
@@ -435,8 +435,6 @@ bool gguf_model::read_gguf()
      *                 attention.sliding_window_pattern[], 512-wide heads
      *                 (key_length/value_length) and
      *                 embedding_length_per_layer_input.
-     *   mellum      - attn_q_norm/attn_k_norm plus a 64-expert MoE layout that the
-     *                 llama path would bind to the wrong shapes, and YaRN rope.
      *
      * Refusing is the honest behaviour here: a wrong answer is worse than none. */
     ERR("Unsupported architecture '%s' - there is no loader for it. Refusing "
@@ -484,6 +482,36 @@ bool gguf_model::read_llama()
     rope_dim   = kv32(p + "rope.dimension_count", 0);
     n_ff       = kv32(p + "feed_forward_length", 0);
 
+    /* Optional rope scaling (mellum uses YaRN) and sliding-window attention.
+     * Both are absent from plain LLaMA checkpoints, which is why they default
+     * to "off" rather than being required. */
+    has_rope_yarn = false;
+    n_swa = 0;
+    rope_freq_scale = 1.0f;
+    if (meta_kv.count(p + "rope.scaling.type")) {
+        rope_scaling = kvrdstr(p + "rope.scaling.type");
+        const float factor = kvf32(p + "rope.scaling.factor", 1.0f);
+        rope_freq_scale   = factor > 0.0f ? 1.0f / factor : 1.0f;
+        rope_orig_context = (int)kv32(p + "rope.scaling.original_context_length", 0);
+        rope_beta_fast    = kvf32(p + "rope.scaling.yarn_beta_fast", 32.0f);
+        rope_beta_slow    = kvf32(p + "rope.scaling.yarn_beta_slow", 1.0f);
+        rope_yarn_attn    = kvf32(p + "rope.scaling.yarn_attn_factor", 1.0f);
+        has_rope_yarn     = (rope_scaling == "yarn");
+    }
+    n_swa = (int)kv32(p + "attention.sliding_window", 0);
+
+    /* Per-layer sliding-window flags. The pattern is a bool array in the file;
+     * without it we fall back to plain full attention. */
+    std::vector<char> swa_pattern;
+    if (meta_kv.count(p + "attention.sliding_window_pattern")) {
+        const uint8_t* raw = base + meta_kv.at(p + "attention.sliding_window_pattern").off;
+        uint32_t et = 0; uint64_t cnt = 0;
+        memcpy(&et,raw,4);
+        memcpy(&cnt,raw + 4,8);
+        if (et == GBOOL && cnt == (uint64_t)n_layers)
+            for (uint64_t i = 0; i < cnt; i++) swa_pattern.push_back(raw[12 + i] ? 1 : 0);
+    }
+
     /* head_dim is not always n_embed/n_heads (e.g. MiniCPM5: 128 vs 96). Honour
      * the explicit key/value lengths when the checkpoint provides them. */
     head_dim = kv32(p + "attention.key_length", n_heads ? n_embed / n_heads : 0);
@@ -516,6 +544,8 @@ bool gguf_model::read_llama()
                 tr[id].att_v = tr[id].att_q;
             }
             else if (key.find("attn_norm") != string::npos) tr[id].att_norm = (float*)ptr;
+            else if (key.find("attn_q_norm") != string::npos) tr[id].att_q_norm = (float*)ptr;
+            else if (key.find("attn_k_norm") != string::npos) tr[id].att_k_norm = (float*)ptr;
             else if (key.find("attn_q.bias") != string::npos) tr[id].att_q_bias = (float*)ptr;
             else if (key.find("attn_k.bias") != string::npos) tr[id].att_k_bias = (float*)ptr;
             else if (key.find("attn_v.bias") != string::npos) tr[id].att_v_bias = (float*)ptr;
@@ -569,6 +599,13 @@ bool gguf_model::read_llama()
             ffn_up_fused = true;
         }
     }
+
+    /* Sliding-window layers keep plain rope at the SWA base frequency; the rest
+     * get the YaRN table and the yarn attention factor. */
+    is_swa.assign(n_layers, 0);
+    if ((int)swa_pattern.size() == n_layers) is_swa = swa_pattern;
+    for (int id = 0; id < n_layers; id++)
+        tr[id].rope_attn = (has_rope_yarn && !is_swa[id]) ? rope_yarn_attn : 1.0f;
 
     /* MoE: derive expert counts from the KV pairs, falling back to tensor shapes. */
     n_expert      = kv32(p + "expert_count", 0);

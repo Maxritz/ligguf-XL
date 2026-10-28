@@ -38,5 +38,5 @@ Not swept here:
 - Phi-4-reasoning-plus-Q3_K_M.gguf (6.9 GB, supported but slow)
 - Ternary-Bonsai / Qwen3.5-9B / Qwen3.8-4B / MiniCPM-V (qwen35, GDN not implemented)
 - Firefly-v5 / gemma-4-E4B (gemma4, no loader)
-- Mellum2.1-12B (mellum, no loader)
+- Mellum2.1-12B (measured separately: 1.16 tok/s prefill, 3.07 tok/s decode)
 

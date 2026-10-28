@@ -268,8 +268,8 @@ Visualization build:
 ```
 
 The FAST engine supports **Q8_0**, **Q1_0**, **Q1_G**, **Q5_0**, **Q5_1**, **IQ4_NL**, **BF16**, and the **Qn_K** family from **Q2_K** through **Q6_K**.
-It also understands **LLaMA**-style checkpoints, **Qwen2/Qwen2.5**, **Qwen2-MoE**, **Qwen3**, **Phi-3/Phi-4**, and **GPT-2**, while a separate **BERT** GGUF can be attached for retrieval memory.
-Architectures without a real loader (currently **gemma2/3/4** and **mellum**) are refused with an error instead of being run through the LLaMA path, which would produce garbage.
+It also understands **LLaMA**-style checkpoints, **Qwen2/Qwen2.5**, **Qwen2-MoE**, **Qwen3**, **Phi-3/Phi-4**, **GPT-2**, and **Mellum**-style MoE with QK-norm and YaRN rope, while a separate **BERT** GGUF can be attached for retrieval memory.
+Architectures without a real loader (currently **gemma2/3/4**) are refused with an error instead of being run through the LLaMA path, which would produce garbage.
 
 Prefill (prompt processing) and token generation are timed and reported separately, and measured numbers live in [fast/BENCH_INFER.md](fast/BENCH_INFER.md).
 

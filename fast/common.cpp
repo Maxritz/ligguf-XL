@@ -48,6 +48,33 @@ void model_state::allocate()
 
     for (int i = 0; i < (int)rope_freq.size(); i++)
         rope_freq[i] = powf(m.rope_base, -2.0f * (float)i / (float)m.rope_dim);
+
+    /* YaRN (mellum): each frequency dimension blends the interpolated and the
+     * extrapolated angle, so the whole blend folds into a per-dim frequency
+     * table. Mirrors ggml's rope_yarn: dimensions below corr_dims[0] keep the
+     * extrapolated frequency, dimensions above corr_dims[1] are divided by the
+     * scale factor, and the ones between ramp linearly. Full-attention layers
+     * use this table, sliding-window layers use the plain one. */
+    if (m.has_rope_yarn && m.rope_dim > 1) {
+        const int   half = m.rope_dim / 2;
+        const int   nc   = m.rope_orig_context > 0 ? m.rope_orig_context : m.n_context;
+        const float lf   = 2.0f * logf(m.rope_base);
+        const float tau  = 6.283185307179586f;
+        const float d0   = floorf((float)m.rope_dim * logf((float)nc / (m.rope_beta_fast * tau)) / lf);
+        const float d1   = ceilf ((float)m.rope_dim * logf((float)nc / (m.rope_beta_slow * tau)) / lf);
+        const float c0   = (std::max)(0.0f, d0);
+        const float c1   = (std::min)((float)(half - 1), d1);
+        const float span = (std::max)(0.001f, c1 - c0);
+
+        m.rope_freq_yarn.resize(half);
+        for (int i = 0; i < half; i++) {
+            float t = ((float)i - c0) / span;
+            t = (std::min)(1.0f, (std::max)(0.0f, t));
+            const float ramp  = 1.0f - t; // 1 = extrapolated, 0 = interpolated
+            const float blend = m.rope_freq_scale * (1.0f - ramp) + ramp;
+            m.rope_freq_yarn[i] = powf(m.rope_base, -2.0f * (float)i / (float)m.rope_dim) * blend;
+        }
+    }
 }
 
 double tmsec()
