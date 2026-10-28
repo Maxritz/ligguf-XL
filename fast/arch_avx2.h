@@ -165,9 +165,25 @@ static inline __m256i q5_expand_qh_to_bytes(const uint8_t* qh4)
 {
     uint32_t qh32 = (uint32_t)qh4[0] | ((uint32_t)qh4[1] << 8) |
                     ((uint32_t)qh4[2] << 16) | ((uint32_t)qh4[3] << 24);
+#if defined(__BMI2__) || defined(_MSC_VER)
+    /* BMI2 PDEP (VEX.LZ.F2.0F38.W0 F5 /r): with mask 0x0101...01 each of the low
+     * 8 source bits lands in the low bit of its own byte, so four PDEPs expand
+     * all 32 high bits into element order. The scalar loop this replaces also
+     * stored 32 separate bytes and then reloaded them 32 wide, which costs a
+     * store-forwarding stall on top of the loop itself. */
+    const uint64_t M = 0x0101010101010101ULL;
+    const uint64_t b0 = _pdep_u64((uint64_t)( qh32        & 0xFFu), M);
+    const uint64_t b1 = _pdep_u64((uint64_t)((qh32 >>  8) & 0xFFu), M);
+    const uint64_t b2 = _pdep_u64((uint64_t)((qh32 >> 16) & 0xFFu), M);
+    const uint64_t b3 = _pdep_u64((uint64_t)((qh32 >> 24) & 0xFFu), M);
+    const __m128i lo = _mm_set_epi64x((long long)b1, (long long)b0);
+    const __m128i hi = _mm_set_epi64x((long long)b3, (long long)b2);
+    return MM256_SET_M128I(hi, lo);
+#else
     uint8_t tmp[32];
     for (int j = 0; j < 32; j++) tmp[j] = (qh32 >> j) & 1;
     return _mm256_loadu_si256((const __m256i*)tmp);
+#endif
 }
 
 /* qs[16] -> 32 unsigned nibble values in element order [0..15 | 16..31] */
@@ -207,21 +223,26 @@ float inline dot_q8_0_q5_1(const block_q8_0* y, const block_q5_1* x, int n)
     __m256 acc = _mm256_setzero_ps();
 
     for (int i = 0; i < nb; i++) {
-        const float d  = fp16_to_fp32(x[i].d)  * fp16_to_fp32(y[i].d);
+        const float dy = fp16_to_fp32(y[i].d);
+        const float dx = fp16_to_fp32(x[i].d);
         const float dm = fp16_to_fp32(x[i].m);
 
         __m256i q8 = _mm256_loadu_si256((const __m256i*)y[i].qs);
         __m256i qs = q5_expand_qs_to_bytes(x[i].qs);
         __m256i qh16 = _mm256_slli_epi16(q5_expand_qh_to_bytes(x[i].qh), 4);
 
-        /* Q5_1 keeps the 5-bit value unsigned (0..31) */
-        __m256i q5 = _mm256_or_si256(qs, qh16);
+        /* Q5_1 stores d*q + m, with q in 0..31. Rewrite it as
+         *     d*(q - 16) + (m + 16*d)
+         * so the quantized part can use the same signed pairwise kernel that the
+         * Q5_0 path proves out (mul_sum_i8_pairs_float), and the offset term
+         * becomes (m + 16*d) * d_y * sum(q8). Using the plain unsigned
+         * maddubs() here instead - as this did - made every result wrong by a
+         * large factor. */
+        __m256i q5 = _mm256_sub_epi8(_mm256_or_si256(qs, qh16), _mm256_set1_epi8(16));
 
-        __m256i prod  = _mm256_maddubs_epi16(q5, q8);
-        __m256i sum32 = _mm256_madd_epi16(prod, _mm256_set1_epi16(1));
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sum32), acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dx * dy),
+                              mul_sum_i8_pairs_float(q5, q8), acc);
 
-        /* min term: m * sum(q8) over all 32 lanes */
         __m256i s16 = _mm256_add_epi16(
             _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q8, 0)),
             _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q8, 1)));
@@ -229,7 +250,9 @@ float inline dot_q8_0_q5_1(const block_q8_0* y, const block_q5_1* x, int n)
         __m128i t = _mm_add_epi32(_mm256_castsi256_si128(s32), _mm256_extracti128_si256(s32, 1));
         t = _mm_hadd_epi32(t, t);
         t = _mm_hadd_epi32(t, t);
-        acc = _mm256_add_ps(acc, _mm256_set1_ps(dm * (float)_mm_cvtsi128_si32(t)));
+        acc = _mm256_add_ps(acc, _mm256_setr_ps(
+            (float)(dy * (dm + 16.0f * dx) * (double)_mm_cvtsi128_si32(t)),
+            0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f));
     }
 
     return hsum_float_8(acc);
