@@ -12,7 +12,6 @@ void fp1632_init();
 
 void dequantize_row_q8_0(const block_q8_0* x, float* y, int64_t k);
 void dequantize_row_q1_0(const block_q1_0* x, float* y, int64_t k);
-void dequantize_row_q1_G(const block_q1_G* x, float* y, int64_t k);
 void dequantize_row_q5_0(const block_q5_0* x, float* y, int64_t k);
 void dequantize_row_q5_1(const block_q5_1* x, float* y, int64_t k);
 void dequantize_row_q2_K(const block_q2_K* x, float* y, int64_t k);
@@ -39,3 +38,9 @@ void layernorm(ftensor &out, const ftensor &x, const float* w, const float* b, i
 void l2norm(ftensor &x);
 void softmax(float* x, int size);
 void gelu(ftensor &x);
+
+/* Numerical quality gate: compare a fused (activation x weight) dot product
+ * against a fully dequantized double-precision reference. Returns the maximum
+ * relative error observed over `trials` synthetic activations. */
+double selftest_row(gguf_type t, const uint8_t* wptr, int n, int trials);
+double selftest_fp16();

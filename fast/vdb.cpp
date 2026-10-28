@@ -79,7 +79,7 @@ static vector<int> bert_tokenize(string in)
     assert(m_brt.ready);
 
     vector<int> out;
-    for (auto &c : in) c = tolower(c);
+    for (auto &c : in) c = (char)tolower((unsigned char)c);
     int i = 0;
     while (i < (int)in.size()) {
         while (i < (int)in.size() && isspace(in[i])) i++;
@@ -131,13 +131,13 @@ static void bert_embed(const string &text, ftensor &out)
     const int n_embed = m.n_embed;
     const int head_dim = m.head_dim;
     const int n_heads = m.n_heads;
-    const float att_scale = 1.0f / sqrtf(head_dim);
+    const float att_scale = 1.0f / sqrtf((float)head_dim);
 
     if ((int)toks.size() > m.n_context - 2) toks.resize(m.n_context - 2);
     toks.insert(toks.begin(),m.tok_cls);
     toks.push_back(m.tok_sep);
 
-    const int ntok = toks.size();
+    const int ntok = (int)toks.size();
     assert(ntok > 0 && ntok <= m.n_context);
 
     m_brt.embd.resize((size_t)ntok * n_embed);
@@ -256,7 +256,7 @@ static vdb_entry make_entry(uint32_t ts, const string &prev_ai, const string &us
     e.context_after = ai;
     bert_embed(user,emb);
     e.vec.resize(emb.size());
-    f32_to_f16_row(emb.data(),e.vec.data(),emb.size());
+    f32_to_f16_row(emb.data(),e.vec.data(),(int)emb.size());
     DBG("VDB entry ts=%u prev_ai_len=%zu user_len=%zu ai_len=%zu emb=[%.4f %.4f %.4f %.4f]",e.timestamp,prev_ai.size(),user.size(),ai.size(),emb[0],emb[1],emb[2],emb[3]);
     return e;
 }
@@ -352,7 +352,7 @@ vecdb vdb_query(string intext)
 
     for (int i = 0; i < (int)m_vdb.size(); i++) {
         if (m_vdb[i].vec.size() != emb.size()) continue;
-        float sim = vec_dot_f16_f32(m_vdb[i].vec.data(),emb.data(),emb.size());
+        float sim = vec_dot_f16_f32(m_vdb[i].vec.data(),emb.data(),(int)emb.size());
         DBG("VDB cand idx=%d sim=%.4f ts=%u",i,sim,m_vdb[i].timestamp);
         if (sim < VDB_LIKENESS_THRESHOLD) continue;
 
@@ -427,7 +427,7 @@ string vdb_to_prompt(const vecdb &mem)
 void vdb_log_turn(string &log, string user, string ai)
 {
     char hdr[64];
-    uint32_t ts = time(NULL);
+    uint32_t ts = (uint32_t)time(NULL);
     snprintf(hdr,sizeof(hdr),"%s%u\n%s\n",VDB_LOG_HDR,ts,VDB_LOG_USER);
 
     log += hdr + user + "\n" + VDB_LOG_AI + "\n" + ai + "\n";

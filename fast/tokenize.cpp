@@ -62,7 +62,7 @@ static const map<string,unsigned char>& gpt2_piece_bytes()
     if (!rev.empty()) return rev;
 
     const vector<string>& tab = gpt2_byte_pieces();
-    for (int i = 0; i < 256; i++) rev[tab[i]] = i;
+    for (int i = 0; i < 256; i++) rev[tab[i]] = (unsigned char)i;
     return rev;
 }
 
@@ -82,11 +82,11 @@ static void tokenize_bpe_fallback(const char* str, vector<int> &out)
 
     while (1) {
         float best_score = -1e10;
-        unsigned best_id = -1;
-        unsigned best_idx = out.size()+1;
+        int best_id = -1;
+        int best_idx = (int)out.size()+1;
 
         string acc;
-        for (unsigned i = 0; i < out.size()-1; i++) {
+        for (int i = 0; i < (int)out.size()-1; i++) {
             acc = g_m.m.tokens.at(out.at(i)) + g_m.m.tokens.at(out.at(i+1));
             if (!g_m.m.tokens_rev.count(acc)) continue;
 
@@ -98,7 +98,7 @@ static void tokenize_bpe_fallback(const char* str, vector<int> &out)
             }
         }
 
-        if (best_idx > out.size()) break;
+        if (best_idx > (int)out.size()) break;
         out[best_idx] = best_id;
         out.erase(out.begin()+best_idx+1);
     }

@@ -20,12 +20,21 @@
 #define MAXMETAKV 500
 #define MAXNAMELEN 1024
 #define QK8_0 32
+#define QK8_1 32
 #define QK_K 256
 #define K_SCALE_SIZE 12
+#define QK4_0 32
+#define QK4_1 32
+#define QK2_0 64
+#define QK1_0 128
+#define QK4_NL 32
+#define QK_MXFP4 32
 
+// ggml/gguf.h enum ggml_type — values are ABI, must match upstream exactly.
+// Ids >= 128 are vendor-private (PrismML fork).
 enum gguf_type {
     F32 = 0, F16 = 1,
-    Q4_0 = 2, Q4_1 = 3, Q4_2 = 4, Q4_3 = 5,
+    Q4_0 = 2, Q4_1 = 3,
     Q5_0 = 6, Q5_1 = 7,
     Q8_0 = 8, Q8_1 = 9,
     Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
@@ -37,8 +46,16 @@ enum gguf_type {
     BF16 = 30,
     TQ1_0 = 34, TQ2_0 = 35,
     MXFP4 = 39,
-    Q1_0 = 40,
-    Q1_G = 41, // previously Q1_0_G128
+    NVFP4 = 40,
+    Q1_0 = 41,   // upstream 1-bit ternary, QK1_0 = 128
+    Q2_0 = 42,   // upstream 2-bit, QK2_0 = 64
+    // vendor-private ids (PrismML fork)
+    PQ2_0  = 142, // Q2_0 codec, group 128
+    PTQ1_0 = 143, // TQ1_0 codec, group 128
+    // LiGGUF-private legacy 1-bit formats (32-value blocks). Ids chosen so they
+    // can never collide with a real GGUF file; old checkpoints keep loading.
+    LQ1_0 = 200,
+    LQ1_G = 201,
     GGUF_TYPE_COUNT
 };
 
@@ -64,16 +81,6 @@ struct gguf_tensor {
 struct block_q8_0 {
     uint16_t d;
     int8_t qs[QK8_0];
-};
-
-struct block_q1_0 {
-    gguf_half d;
-    uint8_t qs[QK8_0/8];
-};
-
-struct block_q1_G {
-    gguf_half d;
-    uint8_t qs[128/8];
 };
 
 struct block_q2_K {
@@ -126,6 +133,89 @@ struct block_q5_1 {
     uint8_t qs[QK8_0/2];
 };
 
+/* ---- legacy 4/8-bit blocks (ggml-common.h) ---- */
+
+struct block_q4_0 {
+    gguf_half d;
+    uint8_t qs[QK4_0/2];   /* nibble-packed: low nibble = j, high nibble = j + qk/2 */
+};
+
+struct block_q4_1 {
+    gguf_half d;
+    gguf_half m;
+    uint8_t qs[QK4_1/2];
+};
+
+struct block_q8_1 {
+    gguf_half d;           /* delta */
+    gguf_half s;           /* d * sum(qs) */
+    int8_t qs[QK8_1];
+};
+
+/* Q2_0: 2 bits per weight, 64 per block, code 0..3 -> (code - 1) * d */
+struct block_q2_0 {
+    gguf_half d;
+    uint8_t qs[QK2_0/4];
+};
+
+/* PQ2_0: identical codec to Q2_0 but 128 weights per block (PrismML fork) */
+struct block_pq2_0 {
+    gguf_half d;
+    uint8_t qs[128/4];
+};
+
+/* MXFP4: E8M0 block scale + 32 E2M1 nibbles */
+struct block_mxfp4 {
+    uint8_t e;
+    uint8_t qs[QK_MXFP4/2];
+};
+
+/* IQ4_NL: 16-entry non-linear 4-bit codebook, 32 values per block.
+ * qs[j] low nibble -> element j, high nibble -> element j + 16. */
+struct block_iq4_nl {
+    gguf_half d;
+    uint8_t qs[QK4_NL/2];
+};
+
+/* TQ1_0: ternary base-3 packing, 256 per block, 1.6875 bpw.
+ * qs packs 5 trits per byte (base-3 digits), qh packs 4 trits per byte.
+ * Decode: xi = ((byte * pow3[n]) * 3 >> 8) - 1, value = (xi - 1) * d. */
+struct block_tq1_0 {
+    uint8_t qs[(QK_K - 4*QK_K/64)/5];  /* 48 B -> 240 values */
+    uint8_t qh[QK_K/64];               /*  4 B ->  16 values */
+    gguf_half d;
+};
+
+/* PTQ1_0: same codec as TQ1_0 but 128 weights per block (PrismML fork). */
+struct block_ptq1_0 {
+    uint8_t qs[(128 - 4*128/64)/5];    /* 24 B -> 120 values */
+    uint8_t qh[128/64];                /*  2 B ->   8 values */
+    gguf_half d;
+};
+
+/* TQ2_0: 2 bits per weight, 256 per block, code 0..3 -> (code - 1) * d */
+struct block_tq2_0 {
+    uint8_t qs[QK_K/4];
+    gguf_half d;
+};
+
+/* Q1_0: 1 bit per weight, 128 per block (upstream) */
+struct block_q1_0 {
+    gguf_half d;
+    uint8_t qs[QK1_0/8];
+};
+
+/* LiGGUF-private legacy 1-bit formats, 32 values per block */
+struct block_lq1_0 {
+    gguf_half d;
+    uint8_t qs[QK8_0/8];
+};
+
+struct block_lq1_G {
+    gguf_half d;
+    uint8_t qs[128/8];
+};
+
 struct block_q8_K {
     float d;
     int8_t qs[QK_K];
@@ -141,20 +231,65 @@ struct wtensor {
     uint8_t* ptr;
     gguf_type type;
     uint32_t rsz;
+    int rows = 0;   // number of rows (output dim) when known
+    int cols = 0;   // row width (input dim) when known
 };
 
+/* Layer kind, detected from which tensors the GGUF actually contains. */
+enum layer_kind {
+    LAYER_UNKNOWN = 0,
+    LAYER_ATTENTION,   // full attention: attn_q/k/v (+ attn_output)
+    LAYER_LINEAR,      // gated delta net: attn_qkv + attn_gate + ssm_*
+};
+
+/* One decoder layer. Weight pointers alias into the mmap'd tensor block and are
+ * never freed; NULL means "tensor absent in this checkpoint". */
 struct trans_block {
-    float* att_norm;
-    wtensor att_q;
+    layer_kind kind;    // full attention vs linear/SSM
+    bool is_full_attn = true; // mirror of `kind`, kept for the legacy loaders
+
+    float* att_norm;        // pre-attention RMSNorm
+    float* att_post_norm;   // post-attention RMSNorm (Qwen3.5 hybrid)
+    wtensor att_q;          // full attention Q (may carry the Q gate)
     wtensor att_k;
     wtensor att_v;
-    wtensor att_out;
-    float* att_q_norm;
-    float* att_k_norm;
-    float* ffn_norm;
+    wtensor att_out;        // attention output projection
+    float* att_q_norm;      // per-head Q RMSNorm
+    float* att_k_norm;      // per-head K RMSNorm
+    float* att_q_bias;      // Q projection bias (qwen2)
+    float* att_k_bias;
+    float* att_v_bias;
+
+    /* linear attention (gated delta net) */
+    wtensor att_qkv;        // fused QKV projection
+    wtensor att_gate;       // z / output gate
+    wtensor ssm_conv1d;     // causal depthwise conv kernel
+    wtensor ssm_dt;         // dt bias
+    wtensor ssm_a;          // -A_log.exp() per head
+    wtensor ssm_beta;       // beta projection
+    wtensor ssm_alpha;      // alpha projection
+    float* ssm_norm;        // per-head output RMSNorm
+    wtensor ssm_out;        // linear attention output projection
+
+    wtensor ffn_norm;
     wtensor ffn_up;
     wtensor ffn_down;
     wtensor ffn_gate;
+
+    /* MoE (llama/qwen*-moe style). ffn_gate_inp is the router logits. */
+    bool is_moe = false;
+    wtensor ffn_gate_inp;   // router: [n_embd, n_expert]
+    wtensor ffn_up_exps;    // fused [n_expert, n_embd, n_ff]
+    wtensor ffn_gate_exps;  // fused [n_expert, n_embd, n_ff]
+    wtensor ffn_down_exps;  // fused [n_expert, n_ff, n_embd]
+    wtensor ffn_up_shexp;   // shared expert (optional)
+    wtensor ffn_gate_shexp;
+    wtensor ffn_down_shexp;
+    wtensor ffn_gate_inp_shexp; // shared-expert scalar gate (qwen2moe)
+    int n_expert = 0;
+    int n_expert_used = 0;
+    int moe_ff = 0;         // expert intermediate width
+    int shexp_ff = 0;       // shared-expert intermediate width
 };
 
 struct bert_block {
@@ -197,6 +332,37 @@ struct gguf_model {
     int rope_orig_context = 0;
     int n_ff; // feed-forward hidden size
     int kv_dim; // total K/V width across KV heads
+    int q_proj_dim; // Q projection output dimension (may be 2x for Qwen3.5 gate)
+    bool has_qgate; // Qwen3.5: Q projection outputs [Q | gate]
+
+    /* hybrid attention (Qwen3.5 / Qwen3.8 / qwen35 arch) */
+    int full_attention_interval; // 0 = all layers are full attention
+    std::vector<char> is_recr;    // per layer: 1 = linear/SSM, 0 = full attention
+
+    /* SSM / gated delta net hyperparameters */
+    int ssm_d_conv;      // conv kernel width
+    int ssm_d_inner;     // value inner size
+    int ssm_d_state;     // key/state head dim
+    int ssm_dt_rank;     // number of value heads (== time-step rank)
+    int ssm_n_group;     // number of key heads
+    int rope_dim_sections[4]; // MRoPE sections
+
+    /* MoE */
+    int n_expert;
+    int n_expert_used;
+    bool moe_norm_w = true;   // renormalize selected expert weights (llama); false for qwen2moe
+    bool moe_shexp = false;   // shared expert present
+
+    /* PrismML Hadamard folding (prism.hadamard.*) */
+    bool  hadamard_enabled = false;
+    bool  hadamard_tied_output = false;
+    int   hadamard_block_size = 0;
+    std::vector<std::string> hadamard_weights;   // names needing the forward transform
+    std::vector<std::string> hadamard_inverse;   // names needing the inverse-after-lookup
+    std::vector<float> hadamard_signs;           // explicit sign vector (empty = identity)
+    int   hadamard_sign_width = 0;               // width the sign vector applies to
+    bool  hadamard_gdn_v_grouped = false;
+    ftensor hadamard_rot;   // [block_size * block_size] rotation matrix, row-major
 
     std::vector<std::string> tokens; // vector of known tokens (pos == index)
     std::map<std::string,int> tokens_rev; // reverse token lookup by string
@@ -222,6 +388,8 @@ struct gguf_model {
     float kvrdf32(const std::string& key) const;
     std::string kvrdstr(const std::string& key) const;
     bool kvrdbool(const std::string& key) const;
+    uint32_t kv32(const std::string& key, uint32_t def) const;   // missing key -> def
+    float    kvf32(const std::string& key, float def) const;
 
     bool open_mmap(const char* fn);
     void close_mmap();
@@ -230,6 +398,12 @@ struct gguf_model {
     bool read_llama();
     bool read_qwen3();
     bool read_bert();
+    bool read_arch();     // generic, dimension-driven loader (preferred)
+    bool finalize();      // post-load fixups (tied output, validation)
+    bool validate() const; // post-load consistency gate
+    void build_hadamard();
+    // returns NULL when the tensor is absent
+    const gguf_tensor* find_tensor(const std::string& name) const;
 };
 
 uint64_t row_size(gguf_type type, int len);

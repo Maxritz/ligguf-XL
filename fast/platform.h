@@ -31,7 +31,7 @@
 
 typedef void* mmap_t;
 
-inline void* mmap_wrap(HANDLE hFile, uint64_t fileSize)
+inline void* mmap_wrap(HANDLE hFile, uint64_t /*fileSize*/)
 {
     HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!hMapping) return MAP_FAILED;

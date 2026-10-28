@@ -39,6 +39,8 @@
 #define ROPE_BASE_KEY "llama.rope.freq_base"
 #define ROPE_DIMS_KEY "llama.rope.dimension_count"
 #define FF_LEN_KEY "llama.feed_forward_length"
+#define KEY_LEN_KEY "llama.attention.key_length"
+#define VALUE_LEN_KEY "llama.attention.value_length"
 
 // Qwen3-specific keys
 #define QWEN3_BLOCK_COUNT_KEY "qwen3.block_count"
@@ -121,14 +123,23 @@ string gguf_model::kvrdstr(const string& key) const
     return rdstr(&p);
 }
 
-bool gguf_model::kvrdbool(const string& key) const
-{
+bool gguf_model::kvrdbool(const string& key) const{
     if (!meta_kv.count(key)) {
         ERR("Key '%s' not found!",key.c_str());
         return false;
     }
     uint8_t* p = base + meta_kv.at(key).off;
     return rd8(&p) != 0;
+}
+
+uint32_t gguf_model::kv32(const string& key, uint32_t def) const
+{
+    return meta_kv.count(key) ? kvrd32(key) : def;
+}
+
+float gguf_model::kvf32(const string& key, float def) const
+{
+    return meta_kv.count(key) ? kvrdf32(key) : def;
 }
 
 static uint64_t skipper(gguf_val_type t, uint8_t* pos)
@@ -168,12 +179,71 @@ static uint64_t skipper(gguf_val_type t, uint8_t* pos)
 
 static inline bool supported_qweight(gguf_type t)
 {
-    return t == Q8_0 || t == Q1_0 || t == Q1_G || t == Q2_K || t == Q3_K || t == Q4_K || t == Q5_K || t == Q6_K || t == Q5_0 || t == Q5_1;
+    switch (t) {
+        case Q8_0: case Q8_1:
+        case Q4_0: case Q4_1:
+        case Q5_0: case Q5_1:
+        case Q2_0:
+        case IQ4_NL:
+        case Q1_0: case LQ1_0: case LQ1_G:
+        case Q2_K: case Q3_K: case Q4_K: case Q5_K: case Q6_K:
+        case PQ2_0: case TQ1_0: case PTQ1_0: case TQ2_0:
+        case MXFP4:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static inline bool supported_rowweight(gguf_type t)
 {
-    return t == F32 || t == F16 || supported_qweight(t);
+    return t == F32 || t == F16 || t == BF16 || t == F64 ||
+           t == I8 || t == I16 || t == I32 || t == I64 ||
+           supported_qweight(t);
+}
+
+/* Byte size of one quantized row of `len` elements. Every supported type has a
+ * fixed block width, so this is a closed-form expression, not a lookup. */
+static uint64_t row_size_of(gguf_type type, int len)
+{
+    switch (type) {
+        case F32:  return sizeof(float) * len;
+        case F16:  return sizeof(gguf_half) * len;
+        case BF16: return sizeof(uint16_t) * len;
+        case F64:  return sizeof(double) * len;
+        case I8:   return len;
+        case I16:  return sizeof(int16_t) * len;
+        case I32:  return sizeof(int32_t) * len;
+        case I64:  return sizeof(int64_t) * len;
+
+        case Q8_0: assert(len % QK8_0 == 0);  return sizeof(block_q8_0)  * (len / QK8_0);
+        case Q8_1: assert(len % QK8_1 == 0);  return sizeof(block_q8_1)  * (len / QK8_1);
+        case Q4_0: assert(len % QK4_0 == 0);  return sizeof(block_q4_0)  * (len / QK4_0);
+        case Q4_1: assert(len % QK4_1 == 0);  return sizeof(block_q4_1)  * (len / QK4_1);
+        case Q5_0: assert(len % QK8_0 == 0);  return sizeof(block_q5_0)  * (len / QK8_0);
+        case Q5_1: assert(len % QK8_0 == 0);  return sizeof(block_q5_1)  * (len / QK8_0);
+
+        case Q2_0: assert(len % QK2_0 == 0);  return sizeof(block_q2_0)  * (len / QK2_0);
+        case IQ4_NL:assert(len % QK4_NL == 0);return sizeof(block_iq4_nl)* (len / QK4_NL);
+        case PQ2_0:assert(len % 128  == 0);   return sizeof(block_pq2_0) * (len / 128);
+        case MXFP4:assert(len % QK_MXFP4 == 0);return sizeof(block_mxfp4)* (len / QK_MXFP4);
+        case TQ1_0:assert(len % QK_K == 0);   return sizeof(block_tq1_0) * (len / QK_K);
+        case PTQ1_0:assert(len % 128 == 0);   return sizeof(block_ptq1_0)* (len / 128);
+        case TQ2_0:assert(len % QK_K == 0);   return sizeof(block_tq2_0) * (len / QK_K);
+        case Q1_0: assert(len % QK1_0 == 0);  return sizeof(block_q1_0)  * (len / QK1_0);
+        case LQ1_0:assert(len % QK8_0 == 0);  return sizeof(block_lq1_0) * (len / QK8_0);
+        case LQ1_G:assert(len % 128  == 0);   return sizeof(block_lq1_G) * (len / 128);
+
+        case Q2_K: assert(len % QK_K == 0);   return sizeof(block_q2_K)  * (len / QK_K);
+        case Q3_K: assert(len % QK_K == 0);   return sizeof(block_q3_K)  * (len / QK_K);
+        case Q4_K: assert(len % QK_K == 0);   return sizeof(block_q4_K)  * (len / QK_K);
+        case Q5_K: assert(len % QK_K == 0);   return sizeof(block_q5_K)  * (len / QK_K);
+        case Q6_K: assert(len % QK_K == 0);   return sizeof(block_q6_K)  * (len / QK_K);
+
+        default:
+            ERR("Unsupported row type %d",type);
+            abort();
+    }
 }
 
 static wtensor mkweight(uint8_t* ptr, const gguf_tensor& tz)
@@ -181,51 +251,15 @@ static wtensor mkweight(uint8_t* ptr, const gguf_tensor& tz)
     wtensor r;
     r.ptr = ptr;
     r.type = tz.type;
-    r.rsz = row_size(tz.type,tz.dims[0]);
+    r.rsz = (uint32_t)row_size(tz.type,(int)tz.dims[0]);
+    r.cols = (int)tz.dims[0];
+    r.rows = tz.dims.size() > 1 ? (int)tz.dims[1] : 1;
     return r;
 }
 
 uint64_t row_size(gguf_type type, int len)
 {
-    switch (type) {
-        case F32:
-            return sizeof(float) * len;
-        case F16:
-            return sizeof(gguf_half) * len;
-        case Q8_0:
-            assert(len % QK8_0 == 0);
-            return sizeof(block_q8_0) * (len / QK8_0);
-        case Q1_0:
-            assert(len % QK8_0 == 0);
-            return sizeof(block_q1_0) * (len / QK8_0);
-        case Q1_G:
-            assert(len % 128 == 0);
-            return sizeof(block_q1_G) * (len / 128);
-        case Q2_K:
-            assert(len % QK_K == 0);
-            return sizeof(block_q2_K) * (len / QK_K);
-        case Q3_K:
-            assert(len % QK_K == 0);
-            return sizeof(block_q3_K) * (len / QK_K);
-        case Q4_K:
-            assert(len % QK_K == 0);
-            return sizeof(block_q4_K) * (len / QK_K);
-        case Q5_K:
-            assert(len % QK_K == 0);
-            return sizeof(block_q5_K) * (len / QK_K);
-        case Q6_K:
-            assert(len % QK_K == 0);
-            return sizeof(block_q6_K) * (len / QK_K);
-        case Q5_0:
-            assert(len % QK8_0 == 0);
-            return sizeof(block_q5_0) * (len / QK8_0);
-        case Q5_1:
-            assert(len % QK8_0 == 0);
-            return sizeof(block_q5_1) * (len / QK8_0);
-        default:
-            ERR("Unsupported row type %d",type);
-            abort();
-    }
+    return row_size_of(type,len);
 }
 
 bool gguf_model::open_mmap(const char* fn)
@@ -274,7 +308,7 @@ bool gguf_model::read_tokenizer()
     }
 
     uint64_t ne = rd64(&pos);
-    if (!vocab_size) vocab_size = ne;
+    if (!vocab_size) vocab_size = (int)ne;
     if ((int)ne != vocab_size) {
         ERR("Unexpected number of tokens %I64u", (unsigned __int64)ne);
         return false;
@@ -283,7 +317,7 @@ bool gguf_model::read_tokenizer()
 
     for (uint64_t i = 0; i < ne; i++) {
         tokens[i] = rdstr(&pos);
-        tokens_rev[tokens[i]] = i;
+        tokens_rev[tokens[i]] = (int)i;
     }
 
     tok_model = meta_kv.count(TOKENS_MODEL_KEY)? kvrdstr(TOKENS_MODEL_KEY) : "";
@@ -316,7 +350,7 @@ bool gguf_model::read_tokenizer()
         merge_rank.clear();
         for (uint64_t i = 0; i < ne; i++) {
             merges[i] = rdstr(&pos);
-            merge_rank[merges[i]] = i;
+            merge_rank[merges[i]] = (int)i;
         }
     }
 
@@ -334,7 +368,7 @@ bool gguf_model::read_gguf()
     p += 4;
 
     uint32_t ver = rd32(&p);
-    if (ver != 3) {
+    if (ver != 2 && ver != 3) {
         ERR("Wrong file version (%u)",ver);
         return false;
     }
@@ -384,30 +418,69 @@ bool gguf_model::read_gguf()
     tok_cls = meta_kv.count(TOKENS_CLS_KEY)? kvrd32(TOKENS_CLS_KEY) : 0;
     tok_mask = meta_kv.count(TOKENS_MASK_KEY)? kvrd32(TOKENS_MASK_KEY) : 0;
 
-    if (arch == "llama") return read_llama();
-    else if (arch == "qwen3" || arch == "qwen35") return read_qwen3();
+    if (arch == "llama" || arch == "qwen" || arch == "qwen2" || arch == "qwen2.5" ||
+        arch == "qwen2moe" || arch == "phi3" || arch == "gemma2" || arch == "gemma3" || arch == "gemma4") return read_llama();
+    else if (arch == "qwen3" || arch == "qwen35" || arch == "qwen3.5" || arch == "qwen3.8") return read_qwen3();
     else if (arch == "bert") return read_bert();
 
     ERR("Unsupported architecture '%s'",arch.c_str());
     return false;
 }
 
+bool gguf_model::finalize()
+{
+    // Tied output embeddings: many checkpoints omit output.weight and reuse the
+    // token embedding matrix for the final projection.
+    if (!t_out.ptr) t_out = t_embed;
+    if (!t_out.ptr) {
+        ERR("Model has neither output.weight nor token_embd.weight");
+        return false;
+    }
+    // The vocab size is needed before buffers are allocated. Prefer the KV entry
+    // but fall back to the token embedding width, which is authoritative.
+    if (!vocab_size) {
+        map<string,gguf_tensor>::const_iterator te = tensors.find(TOKENS_EMBED_KEY);
+        if (te != tensors.end() && te->second.dims.size() > 1)
+            vocab_size = (int)te->second.dims[1];
+    }
+    if (!vocab_size) {
+        ERR("Cannot determine vocabulary size");
+        return false;
+    }
+    return true;
+}
+
 bool gguf_model::read_llama()
 {
-    vocab_size = kvrd32(VOCAB_SIZE_KEY);
-    n_layers = kvrd32(BLOCK_COUNT_KEY);
-    n_embed = kvrd32(EMBED_LEN_KEY);
-    n_heads = kvrd32(HEAD_COUNT_KEY);
-    n_kv_heads = kvrd32(HEAD_KV_COUNT_KEY);
-    n_context = kvrd32(CONTEXT_LEN_KEY);
-    rms_epsilon = kvrdf32(RMS_EPSILON_KEY);
-    rope_base = meta_kv.count(ROPE_BASE_KEY)? kvrdf32(ROPE_BASE_KEY) : 10000.0f;
-    rope_dim = kvrd32(ROPE_DIMS_KEY);
-    n_ff = kvrd32(FF_LEN_KEY);
+    /* All LLaMA-family hparams live under "<arch>." and are dimension-driven. */
+    const string p = arch + ".";
+    const char* pfx = p.c_str();
 
-    head_dim = n_embed / n_heads;
-    assert(head_dim * n_heads == n_embed);
-    kv_dim = (n_embed * n_kv_heads) / n_heads;
+    vocab_size = kv32(p + "vocab_size", 0);
+    n_layers   = kv32(p + "block_count", 0);
+    n_embed    = kv32(p + "embedding_length", 0);
+    n_heads    = kv32(p + "attention.head_count", 0);
+    n_kv_heads = kv32(p + "attention.head_count_kv", n_heads);
+    n_context  = kv32(p + "context_length", 2048);
+    rms_epsilon= kvf32(p + "attention.layer_norm_rms_epsilon", 1e-5f);
+    rope_base  = kvf32(p + "rope.freq_base", 10000.0f);
+    rope_dim   = kv32(p + "rope.dimension_count", 0);
+    n_ff       = kv32(p + "feed_forward_length", 0);
+
+    /* head_dim is not always n_embed/n_heads (e.g. MiniCPM5: 128 vs 96). Honour
+     * the explicit key/value lengths when the checkpoint provides them. */
+    head_dim = kv32(p + "attention.key_length", n_heads ? n_embed / n_heads : 0);
+    const int value_dim = kv32(p + "attention.value_length", head_dim);
+    kv_dim = n_kv_heads * value_dim;
+    q_proj_dim = 0;
+    has_qgate = false;
+    moe_norm_w = (arch != "qwen2moe");
+
+    if (!n_layers || !n_embed || !n_heads) {
+        ERR("Missing LLaMA hparams for arch '%s'",pfx);
+        return false;
+    }
+    if (!rope_dim) rope_dim = head_dim;
 
     tr.resize(n_layers);
     memset(tr.data(),0,n_layers * sizeof(trans_block));
@@ -415,16 +488,37 @@ bool gguf_model::read_llama()
     for (map<string,gguf_tensor>::const_iterator it = tensors.begin(); it != tensors.end(); ++it) {
         const string& key = it->first;
         uint8_t* ptr = tensors_off + it->second.off;
-        if (!key.compare(0,4,"blk.") && key.find(".weight") != string::npos) {
+        if (!key.compare(0,4,"blk.") && (key.find(".weight") != string::npos || key.find(".bias") != string::npos)) {
             int id = atoi(key.c_str()+4);
             assert(id >= 0 && id < n_layers);
 
-            if (key.find("attn_norm") != string::npos) tr[id].att_norm = (float*)ptr;
-            else if (key.find("attn_q") != string::npos) tr[id].att_q = mkweight(ptr,it->second);
+            /* Check combined QKV first (matches attn_q/k but not attn_qkv/proj) */
+            if (key.find("qkv_proj") != string::npos || key.find("attn_qkv") != string::npos || key.find("query_key_value") != string::npos) {
+                tr[id].att_q = mkweight(ptr,it->second);
+                tr[id].att_k = tr[id].att_q;  /* placeholder, split later */
+                tr[id].att_v = tr[id].att_q;
+            }
+            else if (key.find("attn_norm") != string::npos) tr[id].att_norm = (float*)ptr;
+            else if (key.find("attn_q.bias") != string::npos) tr[id].att_q_bias = (float*)ptr;
+            else if (key.find("attn_k.bias") != string::npos) tr[id].att_k_bias = (float*)ptr;
+            else if (key.find("attn_v.bias") != string::npos) tr[id].att_v_bias = (float*)ptr;
+            else if (key.find("attn_q") != string::npos) {
+                tr[id].att_q = mkweight(ptr,it->second);
+                /* the Q projection may be wider than n_embed (separate head_dim) */
+                if (it->second.dims.size() > 1) q_proj_dim = (int)it->second.dims[1];
+            }
             else if (key.find("attn_k") != string::npos) tr[id].att_k = mkweight(ptr,it->second);
             else if (key.find("attn_v") != string::npos) tr[id].att_v = mkweight(ptr,it->second);
             else if (key.find("attn_output") != string::npos) tr[id].att_out = mkweight(ptr,it->second);
-            else if (key.find("ffn_norm") != string::npos) tr[id].ffn_norm = (float*)ptr;
+            else if (key.find("ffn_norm") != string::npos) tr[id].ffn_norm.ptr = (uint8_t*)ptr;
+            else if (key.find("ffn_gate_inp_shexp") != string::npos) tr[id].ffn_gate_inp_shexp = mkweight(ptr,it->second);
+            else if (key.find("ffn_gate_inp") != string::npos) tr[id].ffn_gate_inp = mkweight(ptr,it->second);
+            else if (key.find("ffn_up_exps") != string::npos) tr[id].ffn_up_exps = mkweight(ptr,it->second);
+            else if (key.find("ffn_gate_exps") != string::npos) tr[id].ffn_gate_exps = mkweight(ptr,it->second);
+            else if (key.find("ffn_down_exps") != string::npos) tr[id].ffn_down_exps = mkweight(ptr,it->second);
+            else if (key.find("ffn_up_shexp") != string::npos) tr[id].ffn_up_shexp = mkweight(ptr,it->second);
+            else if (key.find("ffn_gate_shexp") != string::npos) tr[id].ffn_gate_shexp = mkweight(ptr,it->second);
+            else if (key.find("ffn_down_shexp") != string::npos) tr[id].ffn_down_shexp = mkweight(ptr,it->second);
             else if (key.find("ffn_up") != string::npos) tr[id].ffn_up = mkweight(ptr,it->second);
             else if (key.find("ffn_down") != string::npos) tr[id].ffn_down = mkweight(ptr,it->second);
             else if (key.find("ffn_gate") != string::npos) tr[id].ffn_gate = mkweight(ptr,it->second);
@@ -434,6 +528,35 @@ bool gguf_model::read_llama()
         else if (key == OUTPUT_NORM_KEY) t_outnorm = (float*)ptr;
     }
 
+    /* Split combined QKV tensors into Q/K/V views */
+    for (int id = 0; id < n_layers; id++) {
+        if (tr[id].att_q.ptr && tr[id].att_k.ptr == tr[id].att_q.ptr && tr[id].att_v.ptr == tr[id].att_q.ptr) {
+            uint64_t row_bytes = tr[id].att_q.rsz;
+            tr[id].att_k.ptr = tr[id].att_q.ptr + (uint64_t)(n_heads * head_dim) * row_bytes;
+            tr[id].att_v.ptr = tr[id].att_k.ptr + (uint64_t)kv_dim * row_bytes;
+            tr[id].att_k.type = tr[id].att_q.type; tr[id].att_k.rsz = tr[id].att_q.rsz;
+            tr[id].att_v.type = tr[id].att_q.type; tr[id].att_v.rsz = tr[id].att_q.rsz;
+        }
+    }
+
+    if (q_proj_dim <= 0) q_proj_dim = n_heads * head_dim;
+    has_qgate = (q_proj_dim == 2 * n_heads * head_dim);
+
+    /* MoE: derive expert counts from the KV pairs, falling back to tensor shapes. */
+    n_expert      = kv32(p + "expert_count", 0);
+    n_expert_used = kv32(p + "expert_used_count", 1);
+    moe_shexp = false;
+    for (int id = 0; id < n_layers; id++) {
+        trans_block& b = tr[id];
+        if (!b.ffn_gate_inp.ptr) continue;
+        b.is_moe = true;
+        if (n_expert <= 0) n_expert = b.ffn_gate_inp.rows;
+        b.n_expert = n_expert;
+        b.n_expert_used = n_expert_used;
+        b.moe_ff = b.ffn_up_exps.rows ? b.ffn_up_exps.rows : n_ff;
+        if (b.ffn_up_shexp.ptr) { b.shexp_ff = b.ffn_up_shexp.rows; moe_shexp = true; }
+    }
+
     assert(supported_rowweight(t_embed.type));
     assert(supported_rowweight(t_out.type));
     return true;
@@ -441,60 +564,97 @@ bool gguf_model::read_llama()
 
 bool gguf_model::read_qwen3()
 {
-    n_layers = kvrd32(meta_kv.count(QWEN3_BLOCK_COUNT_KEY)? QWEN3_BLOCK_COUNT_KEY : "qwen35.block_count");
+    n_layers = kvrd32(meta_kv.count(QWEN3_BLOCK_COUNT_KEY)? QWEN3_BLOCK_COUNT_KEY : (meta_kv.count("qwen35.block_count")? "qwen35.block_count" : "qwen3.block_count"));
     n_embed = kvrd32(meta_kv.count(QWEN3_EMBED_LEN_KEY)? QWEN3_EMBED_LEN_KEY : "qwen35.embedding_length");
     n_heads = kvrd32(meta_kv.count(QWEN3_HEAD_COUNT_KEY)? QWEN3_HEAD_COUNT_KEY : "qwen35.attention.head_count");
     n_kv_heads = kvrd32(meta_kv.count(QWEN3_HEAD_KV_COUNT_KEY)? QWEN3_HEAD_KV_COUNT_KEY : "qwen35.attention.head_count_kv");
     n_context = kvrd32(meta_kv.count(QWEN3_CONTEXT_LEN_KEY)? QWEN3_CONTEXT_LEN_KEY : "qwen35.context_length");
     rms_epsilon = kvrdf32(meta_kv.count(QWEN3_RMS_EPSILON_KEY)? QWEN3_RMS_EPSILON_KEY : "qwen35.attention.layer_norm_rms_epsilon");
-    rope_base = kvrdf32(meta_kv.count(QWEN3_ROPE_BASE_KEY)? QWEN3_ROPE_BASE_KEY : "qwen35.rope.freq_base");
+    rope_base = meta_kv.count(QWEN3_ROPE_BASE_KEY)? kvrdf32(QWEN3_ROPE_BASE_KEY) : (meta_kv.count("qwen35.rope.freq_base")? kvrdf32("qwen35.rope.freq_base") : 1000000.0f);
     rope_scaling = meta_kv.count(QWEN3_ROPE_SCALING_TYPE_KEY)? kvrdstr(QWEN3_ROPE_SCALING_TYPE_KEY) : (meta_kv.count("qwen35.rope.scaling.type")? kvrdstr("qwen35.rope.scaling.type") : "");
     rope_scale = meta_kv.count(QWEN3_ROPE_SCALING_FACTOR_KEY)? kvrdf32(QWEN3_ROPE_SCALING_FACTOR_KEY) : (meta_kv.count("qwen35.rope.scaling.factor")? kvrdf32("qwen35.rope.scaling.factor") : 1.0f);
     rope_orig_context = meta_kv.count(QWEN3_ROPE_SCALING_ORIG_CTX_KEY)? kvrd32(QWEN3_ROPE_SCALING_ORIG_CTX_KEY) : (meta_kv.count("qwen35.rope.scaling.original_context_length")? kvrd32("qwen35.rope.scaling.original_context_length") : 0);
-    head_dim = meta_kv.count(QWEN3_KEY_LEN_KEY)? kvrd32(QWEN3_KEY_LEN_KEY) : (meta_kv.count("qwen35.attention.key_length")? kvrd32("qwen35.attention.key_length") : n_embed / n_heads);
-    rope_dim = head_dim;
+    head_dim = meta_kv.count(QWEN3_KEY_LEN_KEY)? kvrd32(QWEN3_KEY_LEN_KEY) : (meta_kv.count("qwen35.attention.key_length")? kvrd32("qwen35.attention.key_length") : (n_embed / n_heads));
+    rope_dim = meta_kv.count("qwen35.rope.dimension_count")? kvrd32("qwen35.rope.dimension_count") : head_dim;
     n_ff = kvrd32(meta_kv.count(QWEN3_FF_LEN_KEY)? QWEN3_FF_LEN_KEY : "qwen35.feed_forward_length");
-    int value_dim = kvrd32(meta_kv.count(QWEN3_VALUE_LEN_KEY)? QWEN3_VALUE_LEN_KEY : "qwen35.attention.value_length");
+    int value_dim = meta_kv.count(QWEN3_VALUE_LEN_KEY)? kvrd32(QWEN3_VALUE_LEN_KEY) : (meta_kv.count("qwen35.attention.value_length")? kvrd32("qwen35.attention.value_length") : head_dim);
     kv_dim = n_kv_heads * value_dim;
+    q_proj_dim = 0;
+    has_qgate = false;
     vocab_size = 0;
+
+    int full_attn_iv = meta_kv.count("qwen35.full_attention_interval") ? kvrd32("qwen35.full_attention_interval") : 0;
 
     tr.resize(n_layers);
     memset(tr.data(),0,n_layers * sizeof(trans_block));
 
+    for (int id = 0; id < n_layers; id++) {
+        tr[id].is_full_attn = (full_attn_iv > 0) ? ((id % full_attn_iv) == (full_attn_iv - 1)) : true;
+    }
+
     for (map<string,gguf_tensor>::const_iterator it = tensors.begin(); it != tensors.end(); ++it) {
         const string& key = it->first;
         uint8_t* ptr = tensors_off + it->second.off;
-        if (!key.compare(0,4,"blk.") && key.find(".weight") != string::npos) {
+        if (!key.compare(0,4,"blk.") && (key.find(".weight") != string::npos || key.find(".bias") != string::npos)) {
             int id = atoi(key.c_str()+4);
-            assert(id >= 0 && id < n_layers);
+            if (id < 0 || id >= n_layers) continue;
 
-            if (key.find("attn_norm") != string::npos) tr[id].att_norm = (float*)ptr;
+            if (key.find("attn_qkv") != string::npos || key.find("qkv_proj") != string::npos || key.find("query_key_value") != string::npos) {
+                tr[id].att_q = mkweight(ptr,it->second);
+                tr[id].att_k = tr[id].att_q;
+                tr[id].att_v = tr[id].att_q;
+            }
+            else if (key.find("attn_norm") != string::npos && key.find("post") == string::npos && key.find("pre") == string::npos) tr[id].att_norm = (float*)ptr;
+            else if (key.find("attn_post_norm") != string::npos || key.find("post_attention_norm") != string::npos) tr[id].att_post_norm = (float*)ptr;
             else if (key.find("attn_q_norm") != string::npos) tr[id].att_q_norm = (float*)ptr;
             else if (key.find("attn_k_norm") != string::npos) tr[id].att_k_norm = (float*)ptr;
-            else if (key.find("attn_q") != string::npos) tr[id].att_q = mkweight(ptr,it->second);
-            else if (key.find("attn_k") != string::npos) tr[id].att_k = mkweight(ptr,it->second);
-            else if (key.find("attn_v") != string::npos) tr[id].att_v = mkweight(ptr,it->second);
-            else if (key.find("attn_output") != string::npos) tr[id].att_out = mkweight(ptr,it->second);
-            else if (key.find("ffn_norm") != string::npos) tr[id].ffn_norm = (float*)ptr;
+            else if (key.find("attn_q") != string::npos && key.find("attn_qkv") == string::npos && key.find("q_norm") == string::npos) tr[id].att_q = mkweight(ptr,it->second);
+            else if (key.find("attn_k") != string::npos && key.find("attn_qkv") == string::npos && key.find("k_norm") == string::npos) tr[id].att_k = mkweight(ptr,it->second);
+            else if (key.find("attn_v") != string::npos && key.find("attn_qkv") == string::npos) tr[id].att_v = mkweight(ptr,it->second);
+            else if ((key.find("attn_output") != string::npos || (key.find("attn_out") != string::npos)) && key.find("blk.") != string::npos) tr[id].att_out = mkweight(ptr,it->second);
+            else if (key.find("ffn_norm") != string::npos) tr[id].ffn_norm = mkweight(ptr,it->second);
             else if (key.find("ffn_up") != string::npos) tr[id].ffn_up = mkweight(ptr,it->second);
             else if (key.find("ffn_down") != string::npos) tr[id].ffn_down = mkweight(ptr,it->second);
             else if (key.find("ffn_gate") != string::npos) tr[id].ffn_gate = mkweight(ptr,it->second);
         }
-        else if (key == TOKENS_EMBED_KEY) {
-            t_embed = mkweight(ptr,it->second);
-            if (!vocab_size && it->second.dims.size() > 1) vocab_size = it->second.dims[1];
+        else if (key == TOKENS_EMBED_KEY || key.find("token_embd") != string::npos) {
+            if (!t_embed.ptr) t_embed = mkweight(ptr,it->second);
+            if (!vocab_size && it->second.dims.size() > 1) vocab_size = (int)it->second.dims[1];
         }
-        else if (key == OUTPUT_KEY) {
+        else if (key == OUTPUT_KEY || (key.find("output.weight") != string::npos && key.find("blk.") == string::npos)) {
             t_out = mkweight(ptr,it->second);
-            if (!vocab_size && it->second.dims.size() > 1) vocab_size = it->second.dims[1];
+            if (!vocab_size && it->second.dims.size() > 1) vocab_size = (int)it->second.dims[1];
         }
-        else if (key == OUTPUT_NORM_KEY) t_outnorm = (float*)ptr;
+        else if (key == OUTPUT_NORM_KEY || key.find("output_norm") != string::npos) {
+            if (!t_outnorm) t_outnorm = (float*)ptr;
+        }
     }
+
+    for (int id = 0; id < n_layers; id++) {
+        if (tr[id].att_q.ptr && tr[id].att_k.ptr == tr[id].att_q.ptr && tr[id].att_v.ptr == tr[id].att_q.ptr) {
+            uint64_t row_bytes = tr[id].att_q.rsz;
+            if (tr[id].is_full_attn) {
+                tr[id].att_k.ptr = tr[id].att_q.ptr + (uint64_t)(n_heads * head_dim * 2) * row_bytes;
+                tr[id].att_v.ptr = tr[id].att_k.ptr + (uint64_t)kv_dim * row_bytes;
+                q_proj_dim = n_heads * head_dim * 2;
+                has_qgate = true;
+            } else {
+                /* linear attention: need to figure out dimensions from tensor */
+                /* For now, use reasonable defaults */
+                tr[id].att_k.ptr = tr[id].att_q.ptr + (uint64_t)(n_heads * head_dim * 2) * row_bytes;
+                tr[id].att_v.ptr = tr[id].att_k.ptr + (uint64_t)kv_dim * row_bytes;
+            }
+            tr[id].att_k.type = tr[id].att_q.type; tr[id].att_k.rsz = tr[id].att_q.rsz;
+            tr[id].att_v.type = tr[id].att_q.type; tr[id].att_v.rsz = tr[id].att_q.rsz;
+        }
+    }
+    if (q_proj_dim == 0) q_proj_dim = n_heads * head_dim;
 
     assert(supported_rowweight(t_embed.type));
     assert(supported_rowweight(t_out.type));
     return true;
 }
+
 
 bool gguf_model::read_bert()
 {

@@ -24,6 +24,8 @@ del *.obj 2>nul
 
 cl.exe /std:c++17 /EHsc %OPT% /arch:AVX2 /openmp /D_CRT_SECURE_NO_WARNINGS /D__AVX2__ %DEFS% ^
     lil_math.cpp ^
+    lil_quants.cpp ^
+    hadamard.cpp ^
     lil_gguf.cpp ^
     common.cpp ^
     tokenize.cpp ^

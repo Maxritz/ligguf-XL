@@ -7,12 +7,14 @@
 #include "common.h"
 #include "lil_math.h"
 #include "breadcrumb.h"
+#include "lil_quants.h"
 
 using namespace std;
 
 float fp1632_lut[65536];
 
 static qtensor m_xq8;
+static ktensor m_xqK;
 
 // Acceleration stuff
 #if defined(__AVX2__)
@@ -74,7 +76,7 @@ static inline uint16_t fp32_to_fp16(float f)
     const uint32_t exp_bits = (bits >> 13) & UINT32_C(0x00007C00);
     const uint32_t mantissa_bits = bits & UINT32_C(0x00000FFF);
     const uint32_t nonsign = exp_bits + mantissa_bits;
-    return (sign >> 16) | (shl1_w > UINT32_C(0xFF000000) ? UINT16_C(0x7E00) : nonsign);
+    return (uint16_t)((sign >> 16) | (shl1_w > UINT32_C(0xFF000000) ? UINT16_C(0x7E00) : nonsign));
 }
 
 void fp1632_init()
@@ -94,37 +96,11 @@ static inline void f16_to_f32_row(const gguf_half* x, float* y, int n)
 
 void dequantize_row_q8_0(const block_q8_0* x, float* y, int64_t k)
 {
-    const int nb = k / QK8_0;
+    const int nb = (int)(k / QK8_0);
 
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32(x[i].d);
         for (int j = 0; j < QK8_0; j++) y[i*QK8_0 + j] = x[i].qs[j] * d;
-    }
-}
-
-void dequantize_row_q1_0(const block_q1_0* x, float* y, int64_t k)
-{
-    const int nb = k / QK8_0;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = fp16_to_fp32(x[i].d);
-        for (int j = 0; j < QK8_0; j++) {
-            int b = (x[i].qs[j >> 3] >> (j & 7)) & 1;
-            y[i*QK8_0 + j] = d * (b? 1.0f : -1.0f);
-        }
-    }
-}
-
-void dequantize_row_q1_G(const block_q1_G* x, float* y, int64_t k)
-{
-    const int nb = k / 128;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = fp16_to_fp32(x[i].d);
-        for (int j = 0; j < 128; j++) {
-            int b = (x[i].qs[j >> 3] >> (j & 7)) & 1;
-            y[i*128 + j] = d * (b? 1.0f : -1.0f);
-        }
     }
 }
 
@@ -141,7 +117,7 @@ static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t
 
 void dequantize_row_q2_K(const block_q2_K* x, float* y, int64_t k)
 {
-    const int nb = k / QK_K;
+    const int nb = (int)(k / QK_K);
 
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32(x[i].d);
@@ -174,7 +150,7 @@ void dequantize_row_q3_K(const block_q3_K* x, float* y, int64_t k)
     // - one extra sign/high-bit plane in hmask[32]
     // - 16 signed scales packed into scales[12]
     // - one fp16 block scale d
-    const int nb = k / QK_K;
+    const int nb = (int)(k / QK_K);
     const uint32_t kmask1 = 0x03030303;
     const uint32_t kmask2 = 0x0f0f0f0f;
     uint32_t aux[4];
@@ -215,7 +191,7 @@ void dequantize_row_q4_K(const block_q4_K* x, float* y, int64_t k)
 {
     // Q4_K stores 256 values as 4-bit payloads in qs[128], plus 8 scale/min pairs
     // packed into scales[12]. d scales the values, dmin scales the per-subblock offsets.
-    const int nb = k / QK_K;
+    const int nb = (int)(k / QK_K);
 
     for (int i = 0; i < nb; i++) {
         const uint8_t* q = x[i].qs;
@@ -271,31 +247,39 @@ void dequantize_row_q5_K(const block_q5_K* x, float* y, int64_t k)
 /* qh[4] is bit-packed: bit j of element j lives in qh[j>>3] >> (j&7) */
 void dequantize_row_q5_0(const block_q5_0* x, float* y, int64_t k)
 {
-    const int nb = k / QK8_0;
+    const int nb = (int)(k / QK8_0);
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32(x[i].d);
-        for (int j = 0; j < QK8_0; j++) {
-            const int l  = j / 2;
-            const int qs = (x[i].qs[l] >> ((j & 1) ? 4 : 0)) & 0xF;
-            const int qb = (x[i].qh[j >> 3] >> (j & 7)) & 1;
-            const int v  = qs | (qb << 4);
-            y[i*QK8_0 + j] = d * (float)(int8_t)v;
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+        /* qs[j] low nibble -> element j, high nibble -> element j + qk/2.
+         * Bit j of qh is the 5th bit of element j. Value is 5-bit signed. */
+        for (int j = 0; j < QK8_0/2; ++j) {
+            const int xh0 = (int)(qh >> j)         & 1;
+            const int xh1 = (int)(qh >> (j + 16))  & 1;
+            const int x0 = ((x[i].qs[j] & 0x0F) | (xh0 << 4)) - 16;
+            const int x1 = ((x[i].qs[j] >>   4) | (xh1 << 4)) - 16;
+            y[i*QK8_0 + j + 0     ] = x0*d;
+            y[i*QK8_0 + j + QK8_0/2] = x1*d;
         }
     }
 }
 
 void dequantize_row_q5_1(const block_q5_1* x, float* y, int64_t k)
 {
-    const int nb = k / QK8_0;
+    const int nb = (int)(k / QK8_0);
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32(x[i].d);
         const float m = fp16_to_fp32(x[i].m);
-        for (int j = 0; j < QK8_0; j++) {
-            const int l  = j / 2;
-            const int qs = (x[i].qs[l] >> ((j & 1) ? 4 : 0)) & 0xF;
-            const int qb = (x[i].qh[j >> 3] >> (j & 7)) & 1;
-            const int v  = qs | (qb << 4);
-            y[i*QK8_0 + j] = d * (float)v + m;
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+        for (int j = 0; j < QK8_0/2; ++j) {
+            const int xh0 = (int)(qh >> j)         & 1;
+            const int xh1 = (int)(qh >> (j + 16))  & 1;
+            const int x0 = (x[i].qs[j] & 0x0F) | (xh0 << 4);
+            const int x1 = (x[i].qs[j] >>   4) | (xh1 << 4);
+            y[i*QK8_0 + j + 0     ] = x0*d + m;
+            y[i*QK8_0 + j + QK8_0/2] = x1*d + m;
         }
     }
 }
@@ -335,11 +319,28 @@ void dequantize_row_q6_K(const block_q6_K* x, float* y, int64_t k)
 void dequantize_row(gguf_type t, const void* in, float* out, int64_t n)
 {
     switch (t) {
-    case F32: memcpy(out,in,n*sizeof(float)); break;
-    case F16: f16_to_f32_row((const gguf_half*)in,out,n); break;
+    case F32:  memcpy(out,in,n*sizeof(float)); break;
+    case F16:  f16_to_f32_row((const gguf_half*)in,out,(int)n); break;
+    case BF16: dequantize_row_bf16((const uint16_t*)in,out,n); break;
+    case F64:  for (int64_t i=0;i<n;i++) out[i]=(float)((const double*)in)[i]; break;
+    case I8:   for (int64_t i=0;i<n;i++) out[i]=(float)((const int8_t*)in)[i]; break;
+    case I16:  for (int64_t i=0;i<n;i++) out[i]=(float)((const int16_t*)in)[i]; break;
+    case I32:  dequantize_row_i32((const int32_t*)in,out,n); break;
+    case I64:  for (int64_t i=0;i<n;i++) out[i]=(float)((const int64_t*)in)[i]; break;
     case Q8_0: dequantize_row_q8_0((block_q8_0*)in,out,n); break;
-    case Q1_0: dequantize_row_q1_0((block_q1_0*)in,out,n); break;
-    case Q1_G: dequantize_row_q1_G((block_q1_G*)in,out,n); break;
+    case Q8_1: dequantize_row_q8_1((const block_q8_1*)in,out,n); break;
+    case Q4_0: dequantize_row_q4_0((const block_q4_0*)in,out,n); break;
+    case Q4_1: dequantize_row_q4_1((const block_q4_1*)in,out,n); break;
+    case Q2_0: dequantize_row_q2_0((const block_q2_0*)in,out,n); break;
+    case IQ4_NL:dequantize_row_iq4_nl((const block_iq4_nl*)in,out,n); break;
+    case PQ2_0:dequantize_row_pq2_0((const block_pq2_0*)in,out,n); break;
+    case MXFP4:dequantize_row_mxfp4((const block_mxfp4*)in,out,n); break;
+    case TQ1_0:dequantize_row_tq1_0((const block_tq1_0*)in,out,n); break;
+    case PTQ1_0:dequantize_row_ptq1_0((const block_ptq1_0*)in,out,n); break;
+    case TQ2_0:dequantize_row_tq2_0((const block_tq2_0*)in,out,n); break;
+    case Q1_0: dequantize_row_q1_0((const block_q1_0*)in,out,n); break;
+    case LQ1_0:dequantize_row_lq1_0((const block_lq1_0*)in,out,n); break;
+    case LQ1_G:dequantize_row_lq1_G((const block_lq1_G*)in,out,n); break;
     case Q2_K: dequantize_row_q2_K((block_q2_K*)in,out,n); break;
     case Q3_K: dequantize_row_q3_K((block_q3_K*)in,out,n); break;
     case Q4_K: dequantize_row_q4_K((block_q4_K*)in,out,n); break;
@@ -365,7 +366,7 @@ float vec_dot_f16_f32(const gguf_half* a, const float* b, int size)
 
 void quantize_q8_0(qtensor &y, const ftensor &x)
 {
-    const int nb = x.size() / QK8_0;
+    const int nb = (int)(x.size() / QK8_0);
     if ((int)y.size() < nb) y.resize(nb);
 
     MULTITHREAD
@@ -383,7 +384,7 @@ void quantize_q8_0(qtensor &y, const ftensor &x)
         y[i].d = fp32_to_fp16(d);
 
         for (int j = 0; j < QK8_0; j++)
-            y[i].qs[j] = roundf(x[i * QK8_0 + j] * id);
+            y[i].qs[j] = (int8_t)roundf(x[i * QK8_0 + j] * id);
     }
 }
 
@@ -394,7 +395,7 @@ static inline int nearest_int(float f)
 
 void quantize_q8_K(ktensor &y, const ftensor &x)
 {
-    const int n = x.size();
+    const int n = (int)x.size();
     const int nb = (n + QK_K - 1) / QK_K;   /* round up to cover remainders */
 
     if ((int)y.size() < nb) y.resize(nb);
@@ -423,13 +424,13 @@ void quantize_q8_K(ktensor &y, const ftensor &x)
         memset(y[i].qs, 0, QK_K);  /* zero-pad remainder */
         for (int j = 0; j < ncur; j++) {
             int v = nearest_int(iscale * p[j]);
-            y[i].qs[j] = min(127, max(-128, v));
+            y[i].qs[j] = (int8_t)min(127, max(-128, v));
         }
         for (int j = 0; j < QK_K/16; j++) {
             int sum = 0;
             int jmax = (j+1)*16 <= ncur ? 16 : (ncur - j*16);
             for (int ii = 0; ii < jmax; ii++) sum += (int)y[i].qs[j*16 + ii];
-            y[i].bsums[j] = sum;
+            y[i].bsums[j] = (int16_t)sum;
         }
         y[i].d = 1.0f / iscale;
     }
@@ -462,7 +463,7 @@ float inline dot_q8_0_q8_0(const block_q8_0* x, const block_q8_0* y, int n)
     return acc;
 }
 
-float inline dot_q8_0_q1_0(const block_q8_0* y, const block_q1_0* x, int n)
+float inline dot_q8_0_lq1_0(const block_q8_0* y, const block_lq1_0* x, int n)
 {
     const int nb = n / QK8_0;
     float sumf = 0.0f;
@@ -479,7 +480,7 @@ float inline dot_q8_0_q1_0(const block_q8_0* y, const block_q1_0* x, int n)
     return sumf;
 }
 
-float inline dot_q8_0_q1_G(const block_q8_0* y, const block_q1_G* x, int n)
+float inline dot_q8_0_lq1_G(const block_q8_0* y, const block_lq1_G* x, int n)
 {
     const int nb = n / 128;
     float sumf = 0.0f;
@@ -782,105 +783,161 @@ float inline dot_q8_K_q6_K(const block_q8_K* y, const block_q6_K* x, int n)
 }
 #endif /*ARCH_ACCEL*/
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Single row-dot dispatcher shared by matmul / matmul2 / matmul3.
+ * Keeps every quantization type in exactly one place, so adding a codec cannot
+ * drift between the three call sites.
+ *
+ * `n` is the row width (number of weights). Which activation buffer is used is
+ * decided by the weight's block width:
+ *   QK8_0-wide types  -> qtensor (Q8_0)
+ *   QK_K-wide types   -> ktensor (Q8_K)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static inline bool weight_needs_q8_0(gguf_type t)
+{
+    switch (t) {
+        case Q8_0: case Q8_1: case Q4_0: case Q4_1:
+        case Q5_0: case Q5_1: case Q2_0: case Q1_0:
+        case IQ4_NL:
+        case LQ1_0: case LQ1_G:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool weight_needs_q8_K(gguf_type t)
+{
+    switch (t) {
+        case Q2_K: case Q3_K: case Q4_K: case Q5_K: case Q6_K:
+        case PQ2_0: case TQ1_0: case PTQ1_0: case TQ2_0: case MXFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Both activation forms, resolved once per matmul call. */
+struct actbuf {
+    const block_q8_0* q8;
+    const block_q8_K* qk;
+};
+
+static inline float row_dot(gguf_type t, const uint8_t* wp, const ftensor* src,
+                            const block_q8_0* q8, const block_q8_K* qk, int n)
+{
+    /* Diagnostic: force the slow, always-correct dequantize + float-FMA path.
+     * Set FLOAT_DOT=1. Used to separate "quant codec" bugs from graph bugs. */
+    static int fdmode = -1;
+    if (fdmode < 0) { const char* e = getenv("FLOAT_DOT"); fdmode = e ? atoi(e) : 0; }
+    if (fdmode) {
+        static thread_local std::vector<float> tmp;
+        if ((int)tmp.size() < n) tmp.resize(n);
+        dequantize_row(t, wp, tmp.data(), n);
+        return dot_f32(tmp.data(), src->data(), n);
+    }
+
+    switch (t) {
+        case F32:  return dot_f32((const float*)wp,src->data(),n);
+        case F16:  return dot_f16_f32((const gguf_half*)wp,src->data(),n);
+        case Q8_0: assert(q8); return dot_q8_0_q8_0(q8,(const block_q8_0*)wp,n);
+        case Q8_1: assert(q8); return dot_q8_0_q8_1(q8,(const block_q8_1*)wp,n);
+        case Q4_0: assert(q8); return dot_q8_0_q4_0(q8,(const block_q4_0*)wp,n);
+        case Q4_1: assert(q8); return dot_q8_0_q4_1(q8,(const block_q4_1*)wp,n);
+        case Q5_0: assert(q8); return dot_q8_0_q5_0(q8,(const block_q5_0*)wp,n);
+        case Q5_1: assert(q8); return dot_q8_0_q5_1(q8,(const block_q5_1*)wp,n);
+        case Q2_0: assert(q8); return dot_q8_0_q2_0(q8,(const block_q2_0*)wp,n);
+        case IQ4_NL:assert(q8); return dot_q8_0_iq4_nl(q8,(const block_iq4_nl*)wp,n);
+        case Q1_0: assert(q8); return dot_q8_0_q1_0(q8,(const block_q1_0*)wp,n);
+        case LQ1_0:assert(q8); return dot_q8_0_lq1_0(q8,(const block_lq1_0*)wp,n);
+        case LQ1_G:assert(q8); return dot_q8_0_lq1_G(q8,(const block_lq1_G*)wp,n);
+        case Q2_K: assert(qk); return dot_q8_K_q2_K(qk,(const block_q2_K*)wp,n);
+        case Q3_K: assert(qk); return dot_q8_K_q3_K(qk,(const block_q3_K*)wp,n);
+        case Q4_K: assert(qk); return dot_q8_K_q4_K(qk,(const block_q4_K*)wp,n);
+        case Q5_K: assert(qk); return dot_q8_K_q5_K(qk,(const block_q5_K*)wp,n);
+        case Q6_K: assert(qk); return dot_q8_K_q6_K(qk,(const block_q6_K*)wp,n);
+        case PQ2_0:assert(qk); return dot_q8_K_pq2_0(qk,(const block_pq2_0*)wp,n);
+        case TQ1_0:assert(qk); return dot_q8_K_tq1_0(qk,(const block_tq1_0*)wp,n);
+        case PTQ1_0:assert(qk); return dot_q8_K_ptq1_0(qk,(const block_ptq1_0*)wp,n);
+        case TQ2_0:assert(qk); return dot_q8_K_tq2_0(qk,(const block_tq2_0*)wp,n);
+        case MXFP4:assert(qk); return dot_q8_K_mxfp4(qk,(const block_mxfp4*)wp,n);
+        default:
+            ERR("Unsupported matmul type %d",t);
+            abort();
+    }
+}
+
+/* Resolve the activations the given weight types need, quantizing on demand from
+ * `src` only when the caller did not already supply the right form. Done once per
+ * matmul call, never inside the row loop. */
+static inline actbuf prepare_activation(gguf_type t0, gguf_type t1, gguf_type t2,
+                                        const ftensor* src,
+                                        const ktensor* qxk, const qtensor* qx8)
+{
+    actbuf a; a.q8 = NULL; a.qk = NULL;
+
+    const bool need8 = weight_needs_q8_0(t0) || weight_needs_q8_0(t1) || weight_needs_q8_0(t2);
+    const bool needK = weight_needs_q8_K(t0) || weight_needs_q8_K(t1) || weight_needs_q8_K(t2);
+
+    if (need8) {
+        if (qx8) a.q8 = qx8->data();
+        else { assert(src); quantize_q8_0(m_xq8,*src); a.q8 = m_xq8.data(); }
+    }
+    if (needK) {
+        if (qxk) a.qk = qxk->data();
+        else { assert(src); quantize_q8_K(m_xqK,*src); a.qk = m_xqK.data(); }
+    }
+    return a;
+}
+
 // out: destination vector with d rows
-// src: float activation to quantize on demand when the weight is Q8_0
-// qxk/qx8: pre-quantized activation in Q8_K or Q8_0 form
+// src: float activation to quantize on demand when the weight is Q8_0/Q8_K-family
+// qxk/qx8: pre-quantized activation in Q8_K or Q8_0 form (optional)
 // w: source weight tensor row layout
 // n: input width, d: output width
 void matmul(ftensor &out, const ftensor* src, const ktensor* qxk, const qtensor* qx8, wtensor w, int n, int d)
 {
     STRACE_MATMUL("matmul", n, d);
-    const block_q8_0* q8 = qx8 ? qx8->data() : NULL;
-    if ((w.type == Q8_0 || w.type == Q1_0 || w.type == Q1_G || w.type == Q5_0 || w.type == Q5_1) && !q8) {
-        assert(src);
-        quantize_q8_0(m_xq8,*src);
-        q8 = m_xq8.data();
-    }
+    if (!w.ptr) { ERR("matmul: NULL weight tensor (n=%d d=%d)",n,d); abort(); }
+    if (n <= 0 || d <= 0) { ERR("matmul: bad dims n=%d d=%d",n,d); abort(); }
+
+    const actbuf a = prepare_activation(w.type,w.type,w.type,src,qxk,qx8);
 
     MULTITHREAD
-    for (int r = 0; r < d; r++) {
-        uint8_t* wp = w.ptr + r * w.rsz;
-        switch (w.type) {
-            case F32: out[r] = dot_f32((float*)wp,src->data(),n); break;
-            case F16: out[r] = dot_f16_f32((gguf_half*)wp,src->data(),n); break;
-            case Q8_0: out[r] = dot_q8_0_q8_0(q8,(block_q8_0*)wp,n); break;
-            case Q1_0: out[r] = dot_q8_0_q1_0(q8,(block_q1_0*)wp,n); break;
-            case Q1_G: out[r] = dot_q8_0_q1_G(q8,(block_q1_G*)wp,n); break;
-            case Q2_K: out[r] = dot_q8_K_q2_K(qxk->data(),(block_q2_K*)wp,n); break;
-            case Q3_K: out[r] = dot_q8_K_q3_K(qxk->data(),(block_q3_K*)wp,n); break;
-            case Q4_K: out[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp,n); break;
-            case Q5_K: out[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp,n); break;
-            case Q6_K: out[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp,n); break;
-            case Q5_0: out[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp,n); break;
-            case Q5_1: out[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp,n); break;
-            default:
-                ERR("Unsupported matmul type %d",w.type);
-                abort();
-        }
-    }
+    for (int r = 0; r < d; r++)
+        out[r] = row_dot(w.type,w.ptr + (uint64_t)r * w.rsz,src,a.q8,a.qk,n);
 }
 
 // Same contract as matmul(), but computes two same-shape outputs in one row loop.
+// The two weight matrices need not share a type; both activation forms are resolved.
 void matmul2(ftensor &out0, ftensor &out1, const ftensor* src, const ktensor* qxk, const qtensor* qx8, wtensor w0, wtensor w1, int n, int d)
 {
-    const block_q8_0* q8 = qx8 ? qx8->data() : NULL;
-    if ((w0.type == Q8_0 || w0.type == Q1_0 || w0.type == Q1_G || w0.type == Q5_0 || w0.type == Q5_1 || w1.type == Q8_0 || w1.type == Q1_0 || w1.type == Q1_G || w1.type == Q5_0 || w1.type == Q5_1) && !q8) {
-        assert(src);
-        quantize_q8_0(m_xq8,*src);
-        q8 = m_xq8.data();
-    }
+    if (!w0.ptr || !w1.ptr) { ERR("matmul2: NULL weight tensor"); abort(); }
+    if (n <= 0 || d <= 0) { ERR("matmul2: bad dims n=%d d=%d",n,d); abort(); }
+
+    const actbuf a = prepare_activation(w0.type,w1.type,w1.type,src,qxk,qx8);
 
     MULTITHREAD
     for (int r = 0; r < d; r++) {
-        uint8_t* wp0 = w0.ptr + r * w0.rsz;
-        uint8_t* wp1 = w1.ptr + r * w1.rsz;
-
-        switch (w0.type) {
-            case F32: out0[r] = dot_f32((float*)wp0,src->data(),n); break;
-            case F16: out0[r] = dot_f16_f32((gguf_half*)wp0,src->data(),n); break;
-            case Q8_0: out0[r] = dot_q8_0_q8_0(q8,(block_q8_0*)wp0,n); break;
-            case Q1_0: out0[r] = dot_q8_0_q1_0(q8,(block_q1_0*)wp0,n); break;
-            case Q1_G: out0[r] = dot_q8_0_q1_G(q8,(block_q1_G*)wp0,n); break;
-            case Q2_K: out0[r] = dot_q8_K_q2_K(qxk->data(),(block_q2_K*)wp0,n); break;
-            case Q3_K: out0[r] = dot_q8_K_q3_K(qxk->data(),(block_q3_K*)wp0,n); break;
-            case Q4_K: out0[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp0,n); break;
-            case Q5_K: out0[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp0,n); break;
-            case Q6_K: out0[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp0,n); break;
-            case Q5_0: out0[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp0,n); break;
-            case Q5_1: out0[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp0,n); break;
-            default:
-                ERR("Unsupported matmul type %d",w0.type);
-                abort();
-        }
-
-        switch (w1.type) {
-            case F32: out1[r] = dot_f32((float*)wp1,src->data(),n); break;
-            case F16: out1[r] = dot_f16_f32((gguf_half*)wp1,src->data(),n); break;
-            case Q8_0: out1[r] = dot_q8_0_q8_0(q8,(block_q8_0*)wp1,n); break;
-            case Q1_0: out1[r] = dot_q8_0_q1_0(q8,(block_q1_0*)wp1,n); break;
-            case Q1_G: out1[r] = dot_q8_0_q1_G(q8,(block_q1_G*)wp1,n); break;
-            case Q2_K: out1[r] = dot_q8_K_q2_K(qxk->data(),(block_q2_K*)wp1,n); break;
-            case Q3_K: out1[r] = dot_q8_K_q3_K(qxk->data(),(block_q3_K*)wp1,n); break;
-            case Q4_K: out1[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp1,n); break;
-            case Q5_K: out1[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp1,n); break;
-            case Q6_K: out1[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp1,n); break;
-            case Q5_0: out1[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp1,n); break;
-            case Q5_1: out1[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp1,n); break;
-            default:
-                ERR("Unsupported matmul type %d",w1.type);
-                abort();
-        }
+        out0[r] = row_dot(w0.type,w0.ptr + (uint64_t)r * w0.rsz,src,a.q8,a.qk,n);
+        out1[r] = row_dot(w1.type,w1.ptr + (uint64_t)r * w1.rsz,src,a.q8,a.qk,n);
     }
 }
 
+// Q, K and V in one row loop. d0/d1/d2 are the three output widths, which differ
+// whenever the Q projection also carries a gate (Qwen3.5 hybrid models).
 void matmul3(ftensor &out0, ftensor &out1, ftensor &out2, const ftensor* src, const ktensor* qxk, const qtensor* qx8, wtensor w0, wtensor w1, wtensor w2, int n, int d0, int d1, int d2)
 {
-    const block_q8_0* q8 = qx8 ? qx8->data() : NULL;
-    if ((w0.type == Q8_0 || w0.type == Q1_0 || w0.type == Q1_G || w0.type == Q5_0 || w0.type == Q5_1 || w1.type == Q8_0 || w1.type == Q1_0 || w1.type == Q1_G || w1.type == Q5_0 || w1.type == Q5_1 || w2.type == Q8_0 || w2.type == Q1_0 || w2.type == Q1_G || w2.type == Q5_0 || w2.type == Q5_1) && !q8) {
-        assert(src);
-        quantize_q8_0(m_xq8,*src);
-        q8 = m_xq8.data();
+    if (!w0.ptr || !w1.ptr || !w2.ptr) {
+        ERR("matmul3: NULL weight tensor (q=%p k=%p v=%p)",(void*)w0.ptr,(void*)w1.ptr,(void*)w2.ptr);
+        abort();
     }
+    if (n <= 0 || d0 <= 0 || d1 <= 0 || d2 <= 0) {
+        ERR("matmul3: bad dims n=%d d0=%d d1=%d d2=%d",n,d0,d1,d2);
+        abort();
+    }
+
+    const actbuf a = prepare_activation(w0.type,w1.type,w2.type,src,qxk,qx8);
 
     int d = d0;
     if (d1 > d) d = d1;
@@ -888,69 +945,74 @@ void matmul3(ftensor &out0, ftensor &out1, ftensor &out2, const ftensor* src, co
 
     MULTITHREAD
     for (int r = 0; r < d; r++) {
-        if (r < d0) {
-            uint8_t* wp0 = w0.ptr + r * w0.rsz;
-            switch (w0.type) {
-                case F32: out0[r] = dot_f32((float*)wp0,src->data(),n); break;
-                case F16: out0[r] = dot_f16_f32((gguf_half*)wp0,src->data(),n); break;
-                case Q8_0: out0[r] = dot_q8_0_q8_0(q8,(block_q8_0*)wp0,n); break;
-                case Q1_0: out0[r] = dot_q8_0_q1_0(q8,(block_q1_0*)wp0,n); break;
-                case Q1_G: out0[r] = dot_q8_0_q1_G(q8,(block_q1_G*)wp0,n); break;
-                case Q2_K: out0[r] = dot_q8_K_q2_K(qxk->data(),(block_q2_K*)wp0,n); break;
-                case Q3_K: out0[r] = dot_q8_K_q3_K(qxk->data(),(block_q3_K*)wp0,n); break;
-                case Q4_K: out0[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp0,n); break;
-                case Q5_K: out0[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp0,n); break;
-                case Q6_K: out0[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp0,n); break;
-                case Q5_0: out0[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp0,n); break;
-                case Q5_1: out0[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp0,n); break;
-                default:
-                    ERR("Unsupported matmul type %d",w0.type);
-                    abort();
-            }
-        }
-
-        if (r < d1) {
-            uint8_t* wp1 = w1.ptr + r * w1.rsz;
-            switch (w1.type) {
-                case F32: out1[r] = dot_f32((float*)wp1,src->data(),n); break;
-                case F16: out1[r] = dot_f16_f32((gguf_half*)wp1,src->data(),n); break;
-                case Q8_0: out1[r] = dot_q8_0_q8_0(q8,(block_q8_0*)wp1,n); break;
-                case Q1_0: out1[r] = dot_q8_0_q1_0(q8,(block_q1_0*)wp1,n); break;
-                case Q1_G: out1[r] = dot_q8_0_q1_G(q8,(block_q1_G*)wp1,n); break;
-                case Q2_K: out1[r] = dot_q8_K_q2_K(qxk->data(),(block_q2_K*)wp1,n); break;
-                case Q3_K: out1[r] = dot_q8_K_q3_K(qxk->data(),(block_q3_K*)wp1,n); break;
-                case Q4_K: out1[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp1,n); break;
-                case Q5_K: out1[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp1,n); break;
-                case Q6_K: out1[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp1,n); break;
-                case Q5_0: out1[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp1,n); break;
-                case Q5_1: out1[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp1,n); break;
-                default:
-                    ERR("Unsupported matmul type %d",w1.type);
-                    abort();
-            }
-        }
-
-        if (r < d2) {
-            uint8_t* wp2 = w2.ptr + r * w2.rsz;
-            switch (w2.type) {
-                case F32: out2[r] = dot_f32((float*)wp2,src->data(),n); break;
-                case F16: out2[r] = dot_f16_f32((gguf_half*)wp2,src->data(),n); break;
-                case Q8_0: out2[r] = dot_q8_0_q8_0(q8,(block_q8_0*)wp2,n); break;
-                case Q1_0: out2[r] = dot_q8_0_q1_0(q8,(block_q1_0*)wp2,n); break;
-                case Q1_G: out2[r] = dot_q8_0_q1_G(q8,(block_q1_G*)wp2,n); break;
-                case Q2_K: out2[r] = dot_q8_K_q2_K(qxk->data(),(block_q2_K*)wp2,n); break;
-                case Q3_K: out2[r] = dot_q8_K_q3_K(qxk->data(),(block_q3_K*)wp2,n); break;
-                case Q4_K: out2[r] = dot_q8_K_q4_K(qxk->data(),(block_q4_K*)wp2,n); break;
-                case Q5_K: out2[r] = dot_q8_K_q5_K(qxk->data(),(block_q5_K*)wp2,n); break;
-                case Q6_K: out2[r] = dot_q8_K_q6_K(qxk->data(),(block_q6_K*)wp2,n); break;
-                case Q5_0: out2[r] = dot_q8_0_q5_0(q8,(block_q5_0*)wp2,n); break;
-                case Q5_1: out2[r] = dot_q8_0_q5_1(q8,(block_q5_1*)wp2,n); break;
-                default:
-                    ERR("Unsupported matmul type %d",w2.type);
-                    abort();
-            }
-        }
+        if (r < d0) out0[r] = row_dot(w0.type,w0.ptr + (uint64_t)r * w0.rsz,src,a.q8,a.qk,n);
+        if (r < d1) out1[r] = row_dot(w1.type,w1.ptr + (uint64_t)r * w1.rsz,src,a.q8,a.qk,n);
+        if (r < d2) out2[r] = row_dot(w2.type,w2.ptr + (uint64_t)r * w2.rsz,src,a.q8,a.qk,n);
     }
+}
+
+/* ── numerical self-test ──────────────────────────────────────────────────── */
+
+static void dequant_q8_0_blocks(const block_q8_0* x, int nb, float* y)
+{
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32(x[i].d);
+        for (int j = 0; j < QK8_0; j++) y[i*QK8_0 + j] = x[i].qs[j] * d;
+    }
+}
+
+static void dequant_q8_K_blocks(const block_q8_K* x, int nb, float* y)
+{
+    for (int i = 0; i < nb; i++) {
+        const float d = x[i].d;
+        for (int j = 0; j < QK_K; j++) y[i*QK_K + j] = x[i].qs[j] * d;
+    }
+}
+
+/* Fused dot vs. a fully dequantized double-precision reference. */
+double selftest_row(gguf_type t, const uint8_t* wptr, int n, int trials){
+    std::vector<float> wr(n);
+    dequantize_row(t, wptr, wr.data(), n);
+
+    double worst = 0.0;
+    uint32_t seed = 1234567u;
+    for (int tr = 0; tr < trials; tr++) {
+        ftensor act(n);
+        for (int i = 0; i < n; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            act[i] = ((float)(seed >> 8) / (float)(1u << 24)) * 2.0f - 1.0f;
+        }
+
+        const actbuf a = prepare_activation(t,t,t,&act,NULL,NULL);
+        const float got = row_dot(t, wptr, &act, a.q8, a.qk, n);
+
+        std::vector<float> ar(n);
+        if (weight_needs_q8_0(t))      dequant_q8_0_blocks(a.q8, n/QK8_0, ar.data());
+        else if (weight_needs_q8_K(t)) dequant_q8_K_blocks(a.qk, n/QK_K, ar.data());
+        else for (int i = 0; i < n; i++) ar[i] = act[i];
+
+        double ref = 0.0;
+        for (int i = 0; i < n; i++) ref += (double)wr[i] * (double)ar[i];
+
+        const double denom = fabs(ref) > 1e-12 ? fabs(ref) : 1.0;
+        const double err = fabs(ref - (double)got) / denom;
+        if (err > worst) worst = err;
+    }
+    return worst;
+}
+
+/* Round-trip float -> f16 -> float; returns worst relative error. */
+double selftest_fp16()
+{
+    double worst = 0.0;
+    for (int i = -2000; i <= 2000; i++) {
+        const float v = (float)i * 0.001f + 0.000123f;
+        const float r = fp16_to_fp32(fp32_to_fp16(v));
+        const double denom = fabsf(v) > 1e-4f ? fabsf(v) : 1e-4;
+        const double e = fabs((double)r - (double)v) / denom;
+        if (e > worst) worst = e;
+    }
+    return worst;
 }
 
 void rope(ftensor& x, int n_heads, int pos, const gguf_model &mdl, const ftensor &rope_freq)
@@ -960,16 +1022,18 @@ void rope(ftensor& x, int n_heads, int pos, const gguf_model &mdl, const ftensor
     if (rope_dim > mdl.head_dim) rope_dim = mdl.head_dim;
     if (rope_dim & 1) rope_dim--;
 
+    /* LLaMA-style "half-split" RoPE (ggml GGML_ROPE_TYPE_NORM, is_neox = false):
+     * the two rotated components are (i) and (i + rope_dim/2), NOT adjacent. */
+    const int half = rope_dim / 2;
     for (int h = 0; h < n_heads; h++) {
         float* v = x.data() + h * mdl.head_dim;
-        for (int i = 0; i < rope_dim; i += 2) {
-            const int m = i >> 1;
+        for (int m = 0; m < half; m++) {
             const float ang = pos * rope_freq[m];
             const float c = cosf(ang), s = sinf(ang);
-            const float x0 = v[i + 0];
-            const float x1 = v[i + 1];
-            v[i + 0] = x0 * c - x1 * s;
-            v[i + 1] = x0 * s + x1 * c;
+            const float x0 = v[m];
+            const float x1 = v[m + half];
+            v[m]        = x0 * c - x1 * s;
+            v[m + half] = x0 * s + x1 * c;
         }
     }
 }
@@ -1012,8 +1076,8 @@ void layernorm(ftensor &out, const ftensor &x, const float* w, const float* b, i
     }
     var /= size;
 
-    const float scale = 1.0f / sqrtf(var + epsilon);
-    for (int i = 0; i < size; i++) out[i] = (x[i] - mean) * scale * w[i] + b[i];
+    const float scale = (float)(1.0 / sqrt(var + epsilon));
+    for (int i = 0; i < size; i++) out[i] = (float)((x[i] - mean) * scale * w[i] + b[i]);
 }
 
 void softmax(float* x, int size)

@@ -99,7 +99,7 @@ Now available in **four practical forms**:
 - **Still tiny:** the original C and C++ engines remain compact enough to study line by line on a single sheet of A4.
 - **No dependency stack:** the core path is plain C/C++, and the FAST engine only adds **optional** SDL2 for visualization.
 - **Direct GGUF parsing:** opens `.gguf` files directly via `mmap`, with no conversion or preprocessing step.
-- **Wide quant support:** **Q8_0**, **Q1_0**, **Q1_G**, and **Q2_K/Q3_K/Q4_K/Q5_K/Q6_K**.
+- **Wide quant support:** **Q8_0**, **Q1_0**, **Q1_G**, **Q5_0**, **Q5_1**, and **Q2_K/Q3_K/Q4_K/Q5_K/Q6_K**.
 - **More than one model family:** classic LLaMA-style models, **Qwen3**, and even **BERT** for embeddings.
 - **Readable:** the code is still small enough that every subsystem can be inspected without archaeology.
 - **Functional:** runs full transformer inference with attention, RMSNorm, RoPE, SwiGLU, KV cache, and Top-P/Top-K/greedy sampling.
@@ -132,6 +132,8 @@ The distributed example exists for the same reason: to show you how to tie toget
 
 It doesn't need a heavy external build system of a particular version. It relies on standard tools found in every *NIX system.
 
+### Building on Linux/macOS
+
 So it can't be simpler:
 
 ```
@@ -139,6 +141,27 @@ make
 ```
 
 It will build everything, including **FAST** build with **AVX2/FMA** on x86 or **NEON** on ARM by default.
+
+### Building on Windows (MSVC)
+
+The FAST engine can be built on Windows using **MSVC** (Visual Studio 2022 BuildTools or later).
+A helper script is provided at `fast/build_win.bat`:
+
+```bat
+cd fast
+build_win.bat
+```
+
+This compiles with `/arch:AVX2 /openmp /O2` and produces `ligguf-fast.exe`.
+Add `debug` as an argument for an unoptimized build with debug info:
+
+```bat
+build_win.bat debug
+```
+
+On Windows, a `platform.h` header provides transparent emulation of POSIX functions
+(`mmap`, `fstat`, `open`, `close`, `getopt`, `clock_gettime`, `localtime_r`, `usleep`)
+so the same source compiles unchanged under MSVC.
 
 ---
 
@@ -244,7 +267,7 @@ Visualization build:
 ./ligguf-fast-sdl -m model.gguf -p "Trace this token stream." -n 64 -V
 ```
 
-The FAST engine supports **Q8_0**, **Q1_0**, **Q1_G**, and the **Qn_K** family from **Q2_K** through **Q6_K**.
+The FAST engine supports **Q8_0**, **Q1_0**, **Q1_G**, **Q5_0**, **Q5_1**, and the **Qn_K** family from **Q2_K** through **Q6_K**.
 It also understands both classic **LLaMA**-style checkpoints and **Qwen3** models, while a separate **BERT** GGUF can be attached for retrieval memory.
 
 ---
@@ -268,7 +291,8 @@ It also understands both classic **LLaMA**-style checkpoints and **Qwen3** model
 ### FAST engine
 
 - AVX2/FMA hot paths on x86 and NEON hot paths on ARM
-- Direct support for **Q8_0**, **Q1_0**, **Q1_G**, **Q2_K**, **Q3_K**, **Q4_K**, **Q5_K**, and **Q6_K**
+- Direct support for **Q8_0**, **Q1_0**, **Q1_G**, **Q5_0**, **Q5_1**, **Q2_K**, **Q3_K**, **Q4_K**, **Q5_K**, and **Q6_K**
+- **No runtime dequantization**: Q5_0/Q5_1 use native AVX2 dot-product kernels that operate directly on quantized data
 - LLaMA-style architecture support
 - **Qwen3** architecture support, including its extra attention normalization path
 - **BERT** GGUF loading for embeddings

@@ -52,10 +52,10 @@ extern bool viz_enabled;
 
 #else
 
-static inline bool viz_init(int cols, int rows) { return true; }
+static inline bool viz_init(int /*cols*/, int /*rows*/) { return true; }
 static inline void viz_begin_frame() {}
-static inline void viz_trace_column(int col, const float* x, int n) {}
-static inline void viz_present(int tok) {}
+static inline void viz_trace_column(int /*col*/, const float* /*x*/, int /*n*/) {}
+static inline void viz_present(int /*tok*/) {}
 static inline void viz_quit() {}
 
 bool viz_enabled;

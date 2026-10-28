@@ -12,9 +12,9 @@
 #define MULTITHREAD _Pragma("omp parallel for")
 
 // Helpful debug/error macros
-#define ERR(S,...) fprintf(stderr,S "\n", __VA_ARGS__)
+#define ERR(S,...) fprintf(stderr,S "\n", ##__VA_ARGS__)
 #ifdef DEBUG
-#define DBG(S,...) printf(S "\n", __VA_ARGS__)
+#define DBG(S,...) printf(S "\n", ##__VA_ARGS__)
 #else
 #define DBG(...)
 #endif
@@ -58,6 +58,7 @@ struct model_state {
     ftensor hb; // FFN up output / SwiGLU output
     ftensor hb2; // FFN gate output
     ftensor q, k, v; // current QKV vectors
+    ftensor qgate; // Q-gate vector for Qwen3.5 hybrid models
     htensor kc, vc; // KV cache
     ftensor att; // attention scores/weights
     ftensor rope_freq; // precomputed inverse RoPE frequencies

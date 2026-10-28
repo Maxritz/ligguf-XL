@@ -4,6 +4,7 @@
 
 #include <time.h>
 #include <string>
+#include <algorithm>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -23,13 +24,15 @@ void model_state::allocate()
     }
 
     x.resize(m.n_embed);
-    xb.resize(m.n_embed);
+    const int ctx_dim = m.n_heads * m.head_dim;
+    xb.resize(ctx_dim > m.n_embed ? ctx_dim : m.n_embed); // attention context may be wider
     xb2.resize(m.n_embed);
     xq8.resize(m.n_ff / QK8_0);
     xq.resize(m.n_ff / QK_K);
     hb.resize(m.n_ff);
     hb2.resize(m.n_ff);
-    q.resize(m.n_embed);
+    q.resize(m.q_proj_dim > 0 ? m.q_proj_dim : m.n_embed);
+    qgate.resize(m.has_qgate ? m.n_heads * m.head_dim : 0);
     k.resize(m.kv_dim);
     v.resize(m.kv_dim);
     kc.resize((size_t)m.n_layers * m.n_context * m.kv_dim,0);

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <assert.h>
 #include <time.h>
+#include <algorithm>
 #include "platform.h"
 #include "common.h"
 #include "lil_gguf.h"
@@ -22,10 +23,12 @@ using namespace std;
 
 model_state g_m;
 
+static void moe_ffn(int l);
+
 void inference(int tok)
 {
     PERF_INFERENCE();
-    const float att_scale = 1.0f / sqrtf(g_m.m.head_dim);
+    const float att_scale = 1.0f / sqrtf((float)g_m.m.head_dim);
     const int pos = g_m.pos++;
 
     viz_begin_frame();
@@ -36,14 +39,35 @@ void inference(int tok)
 
     for (int l = 0; l < g_m.m.n_layers; l++) {
         STRACE_INFER(l);
+        /* Skip linear/SSM layers for now if not properly set up */
+        if (!g_m.m.tr[l].att_q.ptr || !g_m.m.tr[l].att_out.ptr) {
+            /* Try to apply just FFN */
+            rmsnorm(g_m.xb,g_m.x,(float*)g_m.m.tr[l].ffn_norm.ptr,g_m.m.n_embed,g_m.m.rms_epsilon);
+            quantize_q8_K(g_m.xq,g_m.xb);
+            matmul2(g_m.hb,g_m.hb2,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].ffn_up,g_m.m.tr[l].ffn_gate,g_m.m.n_embed,g_m.m.n_ff);
+            for (int i = 0; i < g_m.m.n_ff; i++) {
+                const float g = g_m.hb2[i];
+                g_m.hb[i] = (g / (1.0f + expf(-g))) * g_m.hb[i];
+            }
+            quantize_q8_K(g_m.xq,g_m.hb);
+            matmul(g_m.xb,&g_m.hb,&g_m.xq,NULL,g_m.m.tr[l].ffn_down,g_m.m.n_ff,g_m.m.n_embed);
+            for (int j = 0; j < g_m.m.n_embed; j++) g_m.x[j] += g_m.xb[j];
+            continue;
+        }
         // Attention branch: RMSNorm, QKV projections, RoPE on Q/K, cache the new KV, then mix values with attention weights.
         rmsnorm(g_m.xb,g_m.x,g_m.m.tr[l].att_norm,g_m.m.n_embed,g_m.m.rms_epsilon);
 
     quantize_q8_K(g_m.xq,g_m.xb);
     STRACE_MATMUL("qkv_proj", g_m.m.n_embed, g_m.m.n_embed + g_m.m.kv_dim * 2);
-    matmul3(g_m.q,g_m.k,g_m.v,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].att_q,g_m.m.tr[l].att_k,g_m.m.tr[l].att_v,g_m.m.n_embed,g_m.m.n_embed,g_m.m.kv_dim,g_m.m.kv_dim); // Q, K & V
+    int d_q = (g_m.m.q_proj_dim > 0) ? g_m.m.q_proj_dim : g_m.m.n_embed;
+    matmul3(g_m.q,g_m.k,g_m.v,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].att_q,g_m.m.tr[l].att_k,g_m.m.tr[l].att_v,g_m.m.n_embed,d_q,g_m.m.kv_dim,g_m.m.kv_dim); // Q, K & V
 
-        if (g_m.m.arch == "qwen3") {
+        // Qwen2-family attention biases (applied right after the projection)
+        if (g_m.m.tr[l].att_q_bias) for (int i = 0; i < d_q;          i++) g_m.q[i] += g_m.m.tr[l].att_q_bias[i];
+        if (g_m.m.tr[l].att_k_bias) for (int i = 0; i < g_m.m.kv_dim;  i++) g_m.k[i] += g_m.m.tr[l].att_k_bias[i];
+        if (g_m.m.tr[l].att_v_bias) for (int i = 0; i < g_m.m.kv_dim;  i++) g_m.v[i] += g_m.m.tr[l].att_v_bias[i];
+
+        if (g_m.m.arch == "qwen3" || g_m.m.arch == "qwen35" || g_m.m.arch == "qwen3.5" || g_m.m.arch == "qwen3.8") {
             // RMSnorm for current Query and Key
             float* p = g_m.q.data();
             for (int h = 0; h < g_m.m.n_heads; h++, p += g_m.m.head_dim)
@@ -54,16 +78,24 @@ void inference(int tok)
                 rmsnorm_inplace(p,g_m.m.tr[l].att_k_norm,g_m.m.head_dim,g_m.m.rms_epsilon);
         }
 
+        // Handle Q-gate for Qwen3.5
+        if (g_m.m.has_qgate && d_q == g_m.m.n_heads * g_m.m.head_dim * 2) {
+            /* Q and gate are concatenated, store gate separately */
+            for (int h = 0; h < g_m.m.n_heads; h++) {
+                memcpy(g_m.qgate.data() + h * g_m.m.head_dim, g_m.q.data() + (h * 2 + 1) * g_m.m.head_dim, g_m.m.head_dim * sizeof(float));
+            }
+        }
+
         // RoPE Q & K (float vectors)
         rope(g_m.q,g_m.m.n_heads,pos,g_m.m,g_m.rope_freq);
         rope(g_m.k,g_m.m.n_kv_heads,pos,g_m.m,g_m.rope_freq);
 
         // Simple KV cache
         size_t loff = (size_t)l * g_m.m.n_context * g_m.m.kv_dim; // kv cache layer offset
-        gguf_half* kc_row = g_m.kc.data() + loff + pos * g_m.m.kv_dim;
-        gguf_half* vc_row = g_m.vc.data() + loff + pos * g_m.m.kv_dim;
-        f32_to_f16_row(g_m.k.data(),kc_row,g_m.m.kv_dim);
-        f32_to_f16_row(g_m.v.data(),vc_row,g_m.m.kv_dim);
+        gguf_half* kc_write = g_m.kc.data() + loff + pos * g_m.m.kv_dim;
+        gguf_half* vc_write = g_m.vc.data() + loff + pos * g_m.m.kv_dim;
+        f32_to_f16_row(g_m.k.data(),kc_write,g_m.m.kv_dim);
+        f32_to_f16_row(g_m.v.data(),vc_write,g_m.m.kv_dim);
 
         const int nrep = g_m.m.n_heads / g_m.m.n_kv_heads; // GQA, heads per KV head
 
@@ -82,7 +114,9 @@ void inference(int tok)
                 if (t == pos) {
                     score = vec_dot_f32(q,k,g_m.m.head_dim);
                 } else {
-                    kc_row = g_m.kc.data() + loff + t * g_m.m.kv_dim + (h / nrep) * g_m.m.head_dim;
+                    // NOTE: these pointers must be per-iteration locals; a shared
+                    // scratch pointer here is a data race across OpenMP threads.
+                    const gguf_half* kc_row = g_m.kc.data() + loff + t * g_m.m.kv_dim + (h / nrep) * g_m.m.head_dim;
                     score = vec_dot_f16_f32(kc_row,q,g_m.m.head_dim);
                 }
 
@@ -103,21 +137,32 @@ void inference(int tok)
                 if (t == pos) {
                     for (int i = 0; i < g_m.m.head_dim; i++) xb[i] += a * v[i];
                 } else {
-                    vc_row = g_m.vc.data() + loff + t * g_m.m.kv_dim + (h / nrep) * g_m.m.head_dim;
+                    const gguf_half* vc_row = g_m.vc.data() + loff + t * g_m.m.kv_dim + (h / nrep) * g_m.m.head_dim;
                     for (int i = 0; i < g_m.m.head_dim; i++) xb[i] += a * fp16_to_fp32(vc_row[i]);
+                }
+            }
+            /* Apply Q-gate for Qwen3.5 */
+            if (g_m.m.has_qgate && d_q == g_m.m.n_heads * g_m.m.head_dim * 2) {
+                float* gate = g_m.qgate.data() + (h * g_m.m.head_dim);
+                for (int i = 0; i < g_m.m.head_dim; i++) {
+                    float g = gate[i];
+                    xb[i] *= (g / (1.0f + expf(-g))); /* sigmoid */
                 }
             }
         }
 
         // Project the mixed attention result back to model width and add the residual.
+        // The attention context is n_heads*head_dim wide, which is not always n_embed.
+        const int ctx_dim = g_m.m.n_heads * g_m.m.head_dim;
         quantize_q8_K(g_m.xq,g_m.xb);
-        matmul(g_m.xb2,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].att_out,g_m.m.n_embed,g_m.m.n_embed);
+        matmul(g_m.xb2,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].att_out,ctx_dim,g_m.m.n_embed);
         viz_trace_column(1 + l * 2,g_m.xb2.data(),g_m.m.n_embed);
         for (int j = 0; j < g_m.m.n_embed; j++) g_m.x[j] += g_m.xb2[j];
 
         STRACE_FFN(l);
+        if (g_m.m.tr[l].is_moe) { moe_ffn(l); continue; }
         // FFN branch: run up/gate together, apply SwiGLU, project down, then add the residual.
-        rmsnorm(g_m.xb,g_m.x,g_m.m.tr[l].ffn_norm,g_m.m.n_embed,g_m.m.rms_epsilon);
+        rmsnorm(g_m.xb,g_m.x,(float*)g_m.m.tr[l].ffn_norm.ptr,g_m.m.n_embed,g_m.m.rms_epsilon);
 
         quantize_q8_K(g_m.xq,g_m.xb);
         matmul2(g_m.hb,g_m.hb2,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].ffn_up,g_m.m.tr[l].ffn_gate,g_m.m.n_embed,g_m.m.n_ff); // up & gate
@@ -139,7 +184,7 @@ void inference(int tok)
 
     // Final RMSNorm plus the output projection gives logits for the next token.
     rmsnorm(g_m.x,g_m.x,g_m.m.t_outnorm,g_m.m.n_embed,g_m.m.rms_epsilon);
-    if (g_m.m.t_out.type == Q8_0 || g_m.m.t_out.type == Q1_0 || g_m.m.t_out.type == Q1_G) {
+    if (g_m.m.t_out.type == Q8_0 || g_m.m.t_out.type == Q1_0 || g_m.m.t_out.type == LQ1_G) {
         quantize_q8_0(g_m.xq8,g_m.x);
         matmul(g_m.logits,&g_m.x,NULL,&g_m.xq8,g_m.m.t_out,g_m.m.n_embed,g_m.m.vocab_size);
     } else {
@@ -147,6 +192,78 @@ void inference(int tok)
         matmul(g_m.logits,&g_m.x,&g_m.xq,NULL,g_m.m.t_out,g_m.m.n_embed,g_m.m.vocab_size);
     }
     viz_trace_column(1 + g_m.m.n_layers * 2,g_m.logits.data(),g_m.m.vocab_size);
+}
+
+/* Mixture-of-experts FFN. Mirrors llama.cpp build_moe_ffn: softmax router over
+ * all experts, top-k selection, optional renormalization, SiLU experts, and an
+ * optional shared expert with a sigmoid gate (qwen2moe style). */
+static void moe_ffn(int l)
+{
+    const trans_block& b = g_m.m.tr[l];
+    const int ne   = g_m.m.n_embed;
+    const int nf   = b.moe_ff > 0 ? b.moe_ff : g_m.m.n_ff;
+    const int nexp = b.n_expert > 0 ? b.n_expert : g_m.m.n_expert;
+    int nused      = b.n_expert_used > 0 ? b.n_expert_used : g_m.m.n_expert_used;
+    if (nused < 1) nused = 1;
+    if (nused > nexp) nused = nexp;
+
+    rmsnorm(g_m.xb, g_m.x, (float*)b.ffn_norm.ptr, ne, g_m.m.rms_epsilon);
+
+    ftensor router(nexp);
+    matmul(router, &g_m.xb, NULL, NULL, b.ffn_gate_inp, ne, nexp);
+    softmax(router.data(), nexp);
+
+    std::vector<int> sel(nexp);
+    for (int i = 0; i < nexp; i++) sel[i] = i;
+    std::partial_sort(sel.begin(), sel.begin() + nused, sel.end(),
+                      [&](int a, int c){ return router[a] > router[c]; });
+
+    float wsum = 0.0f;
+    if (g_m.m.moe_norm_w)
+        for (int k = 0; k < nused; k++) wsum += router[sel[k]];
+    if (wsum < 1e-20f) wsum = 1.0f;
+
+    const int uf = (b.shexp_ff > nf) ? b.shexp_ff : nf;
+    ftensor up(uf), gate(uf), down(ne), acc(ne);
+    for (int i = 0; i < ne; i++) acc[i] = 0.0f;
+
+    for (int k = 0; k < nused; k++) {
+        const int e = sel[k];
+        const float w = g_m.m.moe_norm_w ? router[e] / wsum : router[e];
+
+        /* experts are stacked with the expert index as the outermost dimension */
+        wtensor wu = b.ffn_up_exps,   wg = b.ffn_gate_exps, wd = b.ffn_down_exps;
+        wu.ptr += (uint64_t)e * nf * wu.rsz;
+        wg.ptr += (uint64_t)e * nf * wg.rsz;
+        wd.ptr += (uint64_t)e * ne * wd.rsz;
+
+        matmul2(up, gate, &g_m.xb, NULL, NULL, wu, wg, ne, nf);
+        for (int i = 0; i < nf; i++) {
+            const float g = gate[i];
+            up[i] = (g / (1.0f + expf(-g))) * up[i];
+        }
+        matmul(down, &up, NULL, NULL, wd, nf, ne);
+        for (int i = 0; i < ne; i++) acc[i] += w * down[i];
+    }
+
+    if (b.ffn_up_shexp.ptr) {
+        const int sf = b.shexp_ff > 0 ? b.shexp_ff : nf;
+        matmul2(up, gate, &g_m.xb, NULL, NULL, b.ffn_up_shexp, b.ffn_gate_shexp, ne, sf);
+        for (int i = 0; i < sf; i++) {
+            const float g = gate[i];
+            up[i] = (g / (1.0f + expf(-g))) * up[i];
+        }
+        matmul(down, &up, NULL, NULL, b.ffn_down_shexp, sf, ne);
+        float sg = 1.0f;
+        if (b.ffn_gate_inp_shexp.ptr) {
+            ftensor g1(1);
+            matmul(g1, &g_m.xb, NULL, NULL, b.ffn_gate_inp_shexp, ne, 1);
+            sg = 1.0f / (1.0f + expf(-g1[0]));
+        }
+        for (int i = 0; i < ne; i++) acc[i] += sg * down[i];
+    }
+
+    for (int i = 0; i < ne; i++) g_m.x[i] += acc[i];
 }
 
 int sampler_greedy()
@@ -469,6 +586,78 @@ static void banner()
     printf("Features enabled: %s\n\n",CAPABILITIES);
 }
 
+/* ── single-position logits dump, for cross-checking against a reference ──── */
+static int run_logits_probe(const char* spec)
+{
+    std::vector<int> toks;
+    for (const char* s = spec; ; ) {
+        toks.push_back(atoi(s));
+        const char* c = strchr(s, ',');
+        if (!c) break;
+        s = c + 1;
+    }
+    for (size_t i = 0; i < toks.size(); i++) {
+        inference(toks[i]);
+        printf("pos %zu tok %d (%s)", i, toks[i], tok_to_str(toks[i]).c_str());
+        if (i + 1 < toks.size()) { printf("\n"); continue; }
+        printf("\n");
+        std::vector<sampler_entry> ord(g_m.logits.size());
+        for (int k = 0; k < (int)g_m.logits.size(); k++) { ord[k].p = g_m.logits[k]; ord[k].tok = k; }
+        std::partial_sort(ord.begin(), ord.begin()+10, ord.end(),
+                          [](const sampler_entry& a, const sampler_entry& b){ return a.p > b.p; });
+        for (int k = 0; k < 10; k++)
+            printf("   %8d  %9.4f  %s\n", ord[k].tok, ord[k].p, tok_to_str(ord[k].tok).c_str());
+    }
+    return 0;
+}
+
+/* ── quality gate: validate every quant codec actually present in the model ── */
+static bool g_selftest = false;
+static int  g_logits_tok = -1;
+static const char* g_logits_spec = NULL;
+static const char* g_tokinfo = NULL;
+
+static int run_selftest()
+{
+    printf("Self-test: fused dot product vs. dequantized reference\n");
+    const int ne = g_m.m.n_embed, nf = g_m.m.n_ff;
+
+    struct probe { wtensor w; int n; const char* where; };
+    std::vector<probe> probes;
+    probes.push_back({g_m.m.t_embed, ne, "token_embd"});
+    probes.push_back({g_m.m.t_out,   ne, "output"});
+    for (int l = 0; l < g_m.m.n_layers; l++) {
+        const trans_block& b = g_m.m.tr[l];
+        if (b.att_q.ptr)     probes.push_back({b.att_q,    ne, "att_q"});
+        if (b.att_k.ptr)     probes.push_back({b.att_k,    ne, "att_k"});
+        if (b.att_v.ptr)     probes.push_back({b.att_v,    ne, "att_v"});
+        if (b.att_out.ptr)   probes.push_back({b.att_out,  ne, "att_out"});
+        if (b.ffn_up.ptr)    probes.push_back({b.ffn_up,   ne, "ffn_up"});
+        if (b.ffn_gate.ptr)  probes.push_back({b.ffn_gate, ne, "ffn_gate"});
+        if (b.ffn_down.ptr)  probes.push_back({b.ffn_down, nf, "ffn_down"});
+    }
+
+    std::map<int,probe> seen;
+    for (size_t i = 0; i < probes.size(); i++) {
+        const probe& p = probes[i];
+        if (!p.w.ptr) continue;
+        if (!seen.count((int)p.w.type)) seen[(int)p.w.type] = p;
+    }
+
+    bool ok = true;
+    for (std::map<int,probe>::const_iterator it = seen.begin(); it != seen.end(); ++it) {
+        const probe& p = it->second;
+        int n = p.n;
+        double err = selftest_row(p.w.type, p.w.ptr, n, 8);
+        const char* verdict = err < 1e-3 ? "ok" : "FAIL";
+        if (err >= 1e-3) ok = false;
+        printf("  type=%-3d n=%-5d maxrel=%.3e  %-4s  (%s)\n", (int)p.w.type, n, err, verdict, p.where);
+    }
+    printf("Self-test %s\n", ok ? "PASSED" : "FAILED");
+    printf("  fp16 round-trip maxrel = %.3e\n", selftest_fp16());
+    return ok ? 0 : 1;
+}
+
 static void usage(const char* progname)
 {
     printf("\nUsage: %s [options]\n",progname);
@@ -497,7 +686,7 @@ static void usage(const char* progname)
 int parse_args(int argc, char* argv[])
 {
     int opt = 0;
-    while ((opt = getopt(argc,argv,"m:n:s:c:p:f:l:S:L:E:A:U:K:T:M:B:GCV")) != -1) {
+    while ((opt = getopt(argc,argv,"m:n:s:c:p:f:l:S:L:E:A:U:K:T:M:B:GCVZY:i:")) != -1) {
         switch (opt) {
         case 'm':
             g_m.model_fn = optarg;
@@ -540,10 +729,10 @@ int parse_args(int argc, char* argv[])
             g_m.topk = atoi(optarg);
             break;
         case 'T':
-            g_m.topp = atof(optarg);
+            g_m.topp = (float)atof(optarg);
             break;
         case 'M':
-            g_m.temp = atof(optarg);
+            g_m.temp = (float)atof(optarg);
             break;
         case 'B':
             g_m.bert_model_fn = optarg;
@@ -557,6 +746,16 @@ int parse_args(int argc, char* argv[])
         case 'V':
             viz_enabled = true;
             break;
+        case 'Z':
+            g_selftest = true;
+            break;
+        case 'Y':
+            g_logits_tok = 1;
+            g_logits_spec = optarg;
+            break;
+        case 'i':
+            g_tokinfo = optarg;
+            break;
         default:
             return -1;
         }
@@ -567,7 +766,7 @@ int parse_args(int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
-    srand(time(NULL));
+    srand((unsigned)time(NULL));
     fp1632_init();
 
     banner();
@@ -579,13 +778,25 @@ int main(int argc, char* argv[])
     PERF_MODEL_LOAD();
     assert(g_m.m.open_mmap(g_m.model_fn.c_str()));
     assert(g_m.m.read_gguf());
+    assert(g_m.m.finalize());
     PERF_MODEL_LOAD_END();
     STRACE_MODEL(g_m.m.arch.c_str());
     g_m.allocate();
+    if (g_selftest) return run_selftest();
     PERF_TOKENIZE();
     assert(g_m.m.read_tokenizer());
     PERF_TOKENIZE_END();
     STRACE_TOKENIZER(g_m.m.vocab_size);
+
+    if (g_tokinfo) {
+        std::vector<int> ids = tokenize(g_tokinfo, true, false);
+        printf("tokenization of %s (%zu tokens):\n", g_tokinfo, ids.size());
+        for (size_t i = 0; i < ids.size(); i++)
+            printf("   %8d  %s\n", ids[i], g_m.m.tokens[ids[i]].c_str());
+        return 0;
+    }
+
+    if (g_logits_tok >= 0) return run_logits_probe(g_logits_spec);
 
     if (!g_m.load_state.empty() && !load_model_state(g_m.load_state.c_str())) return 2;
 
