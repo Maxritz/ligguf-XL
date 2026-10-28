@@ -275,6 +275,7 @@ struct trans_block {
     wtensor ffn_up;
     wtensor ffn_down;
     wtensor ffn_gate;
+    bool ffn_up_fused = false; // Phi-3/Phi-4: gate+up share one [n_embed, 2*n_ff] tensor
 
     /* MoE (llama/qwen*-moe style). ffn_gate_inp is the router logits. */
     bool is_moe = false;
@@ -331,6 +332,7 @@ struct gguf_model {
     float rope_scale = 1.0f;
     int rope_orig_context = 0;
     int n_ff; // feed-forward hidden size
+    bool ffn_up_fused = false; // any layer keeps gate+up fused in ffn_up
     int kv_dim; // total K/V width across KV heads
     int q_proj_dim; // Q projection output dimension (may be 2x for Qwen3.5 gate)
     bool has_qgate; // Qwen3.5: Q projection outputs [Q | gate]

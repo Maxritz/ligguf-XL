@@ -27,9 +27,13 @@ void model_state::allocate()
     const int ctx_dim = m.n_heads * m.head_dim;
     xb.resize(ctx_dim > m.n_embed ? ctx_dim : m.n_embed); // attention context may be wider
     xb2.resize(m.n_embed);
-    xq8.resize(m.n_ff / QK8_0);
-    xq.resize(m.n_ff / QK_K);
-    hb.resize(m.n_ff);
+    // Activation scratch must hold the widest row we ever quantize, which is not
+    // always n_ff: some models have n_embed > n_ff (MoE experts), and Phi-3/4
+    // FFN activations are 2*n_ff wide before the SwiGLU split.
+    const int q_wide = m.n_ff > m.n_embed ? m.n_ff : m.n_embed;
+    xq8.resize(q_wide / QK8_0);
+    xq.resize(q_wide / QK_K);
+    hb.resize(m.ffn_up_fused ? 2 * m.n_ff : m.n_ff);
     hb2.resize(m.n_ff);
     q.resize(m.q_proj_dim > 0 ? m.q_proj_dim : m.n_embed);
     qgate.resize(m.has_qgate ? m.n_heads * m.head_dim : 0);

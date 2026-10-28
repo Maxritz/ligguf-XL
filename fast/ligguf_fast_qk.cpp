@@ -25,6 +25,35 @@ model_state g_m;
 
 static void moe_ffn(int l);
 
+/* SwiGLU feed-forward. Most checkpoints keep gate and up in two separate
+ * tensors; Phi-3 and Phi-4 fuse them into blk.N.ffn_up [n_embed, 2*n_ff] with
+ * gate first (the same split ggml applies in its GLU op). Running a single wide
+ * matmul and splitting is what keeps the fused case off a null ffn_gate. */
+static inline void ffn_swiglu(int l)
+{
+    const trans_block& b = g_m.m.tr[l];
+
+    if (b.ffn_up_fused) {
+        const int nf = g_m.m.n_ff;
+        quantize_q8_K(g_m.xq,g_m.xb);
+        matmul(g_m.hb,&g_m.xb,&g_m.xq,NULL,b.ffn_up,g_m.m.n_embed,nf * 2);
+        for (int i = 0; i < nf; i++) {
+            const float g = g_m.hb[i];
+            g_m.hb[i] = (g / (1.0f + expf(-g))) * g_m.hb[nf + i];
+        }
+        return;
+    }
+
+    quantize_q8_K(g_m.xq,g_m.xb);
+    matmul2(g_m.hb,g_m.hb2,&g_m.xb,&g_m.xq,NULL,b.ffn_up,b.ffn_gate,g_m.m.n_embed,g_m.m.n_ff);
+
+    // silu(gate) * up
+    for (int i = 0; i < g_m.m.n_ff; i++) {
+        const float g = g_m.hb2[i];
+        g_m.hb[i] = (g / (1.0f + expf(-g))) * g_m.hb[i];
+    }
+}
+
 void inference(int tok)
 {
     PERF_INFERENCE();
@@ -43,12 +72,7 @@ void inference(int tok)
         if (!g_m.m.tr[l].att_q.ptr || !g_m.m.tr[l].att_out.ptr) {
             /* Try to apply just FFN */
             rmsnorm(g_m.xb,g_m.x,(float*)g_m.m.tr[l].ffn_norm.ptr,g_m.m.n_embed,g_m.m.rms_epsilon);
-            quantize_q8_K(g_m.xq,g_m.xb);
-            matmul2(g_m.hb,g_m.hb2,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].ffn_up,g_m.m.tr[l].ffn_gate,g_m.m.n_embed,g_m.m.n_ff);
-            for (int i = 0; i < g_m.m.n_ff; i++) {
-                const float g = g_m.hb2[i];
-                g_m.hb[i] = (g / (1.0f + expf(-g))) * g_m.hb[i];
-            }
+            ffn_swiglu(l);
             quantize_q8_K(g_m.xq,g_m.hb);
             matmul(g_m.xb,&g_m.hb,&g_m.xq,NULL,g_m.m.tr[l].ffn_down,g_m.m.n_ff,g_m.m.n_embed);
             for (int j = 0; j < g_m.m.n_embed; j++) g_m.x[j] += g_m.xb[j];
@@ -163,15 +187,7 @@ void inference(int tok)
         if (g_m.m.tr[l].is_moe) { moe_ffn(l); continue; }
         // FFN branch: run up/gate together, apply SwiGLU, project down, then add the residual.
         rmsnorm(g_m.xb,g_m.x,(float*)g_m.m.tr[l].ffn_norm.ptr,g_m.m.n_embed,g_m.m.rms_epsilon);
-
-        quantize_q8_K(g_m.xq,g_m.xb);
-        matmul2(g_m.hb,g_m.hb2,&g_m.xb,&g_m.xq,NULL,g_m.m.tr[l].ffn_up,g_m.m.tr[l].ffn_gate,g_m.m.n_embed,g_m.m.n_ff); // up & gate
-
-        // Apply SwiGLU: silu(gate) * up
-        for (int i = 0; i < g_m.m.n_ff; i++) {
-            const float g = g_m.hb2[i];
-            g_m.hb[i] = (g / (1.0f + expf(-g))) * g_m.hb[i];
-        }
+        ffn_swiglu(l);
 
         // Down projection (quantize hidden, matmul)
         quantize_q8_K(g_m.xq,g_m.hb);
@@ -436,12 +452,19 @@ static void trim_line(string &s)
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
 }
 
+// Prefill (prompt processing) and decode (token generation) are timed
+// separately. Everything fed outside the generation loop is prefill, so the
+// flag is raised only around that loop and cleared again afterwards - that
+// keeps chat turns and RAG injection classified correctly with no bookkeeping.
+static bool g_in_gen = false;
+
 static void inline timed_inference(int tok)
 {
     double t0 = tmsec();
     inference(tok);
-    g_m.gen_ms += tmsec() - t0;
-    g_m.ntimed++;
+    const double dt = tmsec() - t0;
+    if (g_in_gen) { g_m.gen_ms += dt;     g_m.ntimed++;  }
+    else          { g_m.prefill_ms += dt; g_m.nprefill++; }
 }
 
 static int inline timed_sampling()
@@ -480,12 +503,22 @@ void feed_text(string s, bool echo, bool bos, bool space = false)
 
 static void stats()
 {
+    printf("\n");
+    if (g_m.nprefill && g_m.prefill_ms > 0)
+        printf("Prefill:          %6d tokens in %9.1f ms  ->  %8.2f tok/s\n",
+               g_m.nprefill, g_m.prefill_ms,
+               (double)g_m.nprefill * 1000.0 / g_m.prefill_ms);
     if (g_m.ntimed && g_m.gen_ms > 0) {
-        printf("\n\nInference-only tok/s: %.2f\n", (double)g_m.ntimed * 1000.0 / g_m.gen_ms);
-        printf("Inference per-token average time: %.2f ms\n", g_m.gen_ms / (double)g_m.ntimed);
+        printf("Token generation: %6d tokens in %9.1f ms  ->  %8.2f tok/s\n",
+               g_m.ntimed, g_m.gen_ms,
+               (double)g_m.ntimed * 1000.0 / g_m.gen_ms);
+        printf("Generation per-token average time: %.2f ms\n", g_m.gen_ms / (double)g_m.ntimed);
     }
+    if (g_m.nprefill + g_m.ntimed > 0 && g_m.prefill_ms + g_m.gen_ms > 0)
+        printf("Combined inference-only tok/s: %.2f\n",
+               (double)(g_m.nprefill + g_m.ntimed) * 1000.0 / (g_m.prefill_ms + g_m.gen_ms));
     if (g_m.nsampled && g_m.samp_ms > 0)
-        printf("Sampling per-token average time: %.2f ms", g_m.samp_ms / (double)g_m.nsampled);
+        printf("Sampling per-token average time: %.2f ms\n", g_m.samp_ms / (double)g_m.nsampled);
 }
 
 void generate()
@@ -495,6 +528,7 @@ void generate()
 
     int ng = g_m.n_gen? g_m.n_gen : g_m.m.n_context;
     if (ng > g_m.m.n_context) ng = g_m.m.n_context;
+    g_in_gen = true;
     for (int tok,i = 0; i < ng; i++) {
         tok = timed_sampling();
         if (!tok || tok == g_m.m.tok_eos) break;
@@ -503,6 +537,7 @@ void generate()
         if (i) viz_present(tok);
         if (i < g_m.n_gen-1) timed_inference(tok);
     }
+    g_in_gen = false;
 }
 
 void pre_chat()

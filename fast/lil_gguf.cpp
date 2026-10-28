@@ -419,11 +419,29 @@ bool gguf_model::read_gguf()
     tok_mask = meta_kv.count(TOKENS_MASK_KEY)? kvrd32(TOKENS_MASK_KEY) : 0;
 
     if (arch == "llama" || arch == "qwen" || arch == "qwen2" || arch == "qwen2.5" ||
-        arch == "qwen2moe" || arch == "phi3" || arch == "gemma2" || arch == "gemma3" || arch == "gemma4") return read_llama();
+        arch == "qwen2moe" || arch == "phi3") return read_llama();
     else if (arch == "qwen3" || arch == "qwen35" || arch == "qwen3.5" || arch == "qwen3.8") return read_qwen3();
     else if (arch == "bert") return read_bert();
 
-    ERR("Unsupported architecture '%s'",arch.c_str());
+    /* These must NOT fall through to read_llama(). They used to be listed there,
+     * and because the loader silently binds whatever tensors it recognises, the
+     * graph then ran with null weights and emitted confident, incoherent text.
+     *
+     *   gemma2/3/4  - RMSNorm is x*rsqrt(ms)*(1+w), not *w; the FFN is GeGLU, not
+     *                 SwiGLU; attention is sliding-window; and both the attention
+     *                 logits and the final logits are softcapped. gemma4 adds
+     *                 per-layer feed_forward_length[], attention.shared_kv_layers,
+     *                 attention.sliding_window_pattern[], 512-wide heads
+     *                 (key_length/value_length) and
+     *                 embedding_length_per_layer_input.
+     *   mellum      - attn_q_norm/attn_k_norm plus a 64-expert MoE layout that the
+     *                 llama path would bind to the wrong shapes.
+     *   gpt2        - LayerNorm (not RMS), learned position embeddings, GELU and
+     *                 biases on every projection: a different graph entirely.
+     *
+     * Refusing is the honest behaviour here: a wrong answer is worse than none. */
+    ERR("Unsupported architecture '%s' - there is no loader for it. Refusing "
+        "rather than running the LLaMA path and emitting garbage.",arch.c_str());
     return false;
 }
 
@@ -541,6 +559,17 @@ bool gguf_model::read_llama()
 
     if (q_proj_dim <= 0) q_proj_dim = n_heads * head_dim;
     has_qgate = (q_proj_dim == 2 * n_heads * head_dim);
+
+    /* Phi-3/Phi-4 fuse the SwiGLU gate and up into one blk.N.ffn_up.weight of
+     * width 2*n_ff (gate first, matching ggml's GLU split). Without this the
+     * graph reads a null ffn_gate and produces nonsense. */
+    for (int id = 0; id < n_layers; id++) {
+        if (tr[id].ffn_up.ptr && !tr[id].ffn_gate.ptr && n_ff > 0 &&
+            tr[id].ffn_up.rows == 2 * n_ff) {
+            tr[id].ffn_up_fused = true;
+            ffn_up_fused = true;
+        }
+    }
 
     /* MoE: derive expert counts from the KV pairs, falling back to tensor shapes. */
     n_expert      = kv32(p + "expert_count", 0);

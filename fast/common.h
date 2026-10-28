@@ -65,8 +65,10 @@ struct model_state {
     ftensor logits; // output logits for the next token
     std::vector<sampler_entry> samp; // TopP work buffer
 
-    int ntimed = 0; // number of times we've timed the inference
-    double gen_ms = 0; // total time length of all inference steps
+    int ntimed = 0; // number of generated tokens we've timed
+    double gen_ms = 0; // total time of all generation steps (decode)
+    int nprefill = 0; // number of prompt tokens processed
+    double prefill_ms = 0; // total time of all prompt processing (prefill)
     int nsampled = 0; // number of times we've timed the sampler
     double samp_ms = 0; // total time length of all sampling steps
 
