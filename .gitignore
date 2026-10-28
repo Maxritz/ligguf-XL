@@ -1,2 +1,10 @@
 ligguf-*
 model
+
+# build artifacts and benchmark scratch output
+*.obj
+*.exe
+*.ilk
+*.pdb
+vnpu-trace.json
+*_run*.txt
