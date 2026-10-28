@@ -650,6 +650,15 @@ bool gguf_model::read_qwen3()
 
     int full_attn_iv = meta_kv.count("qwen35.full_attention_interval") ? kvrd32("qwen35.full_attention_interval") : 0;
 
+    /* Gated delta net hyperparameters (qwen35 hybrid stacks). All absent for a
+     * plain qwen3 checkpoint, which is why they default to 0. */
+    const bool is_gdn = meta_kv.count("qwen35.ssm.state_size") != 0;
+    ssm_d_conv  = (int)kv32("qwen35.ssm.conv_kernel", 0);
+    ssm_d_inner = (int)kv32("qwen35.ssm.inner_size", 0);
+    ssm_d_state = (int)kv32("qwen35.ssm.state_size", 0);
+    ssm_dt_rank = (int)kv32("qwen35.ssm.time_step_rank", 0);
+    ssm_n_group = (int)kv32("qwen35.ssm.group_count", 0);
+
     tr.resize(n_layers);
     memset(tr.data(),0,n_layers * sizeof(trans_block));
 
@@ -673,6 +682,13 @@ bool gguf_model::read_qwen3()
             else if (key.find("attn_post_norm") != string::npos || key.find("post_attention_norm") != string::npos) tr[id].att_post_norm = (float*)ptr;
             else if (key.find("attn_q_norm") != string::npos) tr[id].att_q_norm = (float*)ptr;
             else if (key.find("attn_k_norm") != string::npos) tr[id].att_k_norm = (float*)ptr;
+            else if (key.find("attn_gate") != string::npos) tr[id].att_gate = mkweight(ptr,it->second);
+            else if (key.find("ssm_conv1d") != string::npos) tr[id].ssm_conv1d = mkweight(ptr,it->second);
+            else if (key.find("ssm_alpha") != string::npos) tr[id].ssm_alpha = mkweight(ptr,it->second);
+            else if (key.find("ssm_beta") != string::npos) tr[id].ssm_beta = mkweight(ptr,it->second);
+            else if (key.find("ssm_dt") != string::npos) tr[id].ssm_dt = mkweight(ptr,it->second);
+            else if (key.find("ssm_norm") != string::npos) tr[id].ssm_norm = (float*)ptr;
+            else if (key.find("ssm_out") != string::npos) tr[id].ssm_out = mkweight(ptr,it->second);
             else if (key.find("attn_q") != string::npos && key.find("attn_qkv") == string::npos && key.find("q_norm") == string::npos) tr[id].att_q = mkweight(ptr,it->second);
             else if (key.find("attn_k") != string::npos && key.find("attn_qkv") == string::npos && key.find("k_norm") == string::npos) tr[id].att_k = mkweight(ptr,it->second);
             else if (key.find("attn_v") != string::npos && key.find("attn_qkv") == string::npos) tr[id].att_v = mkweight(ptr,it->second);
@@ -681,6 +697,11 @@ bool gguf_model::read_qwen3()
             else if (key.find("ffn_up") != string::npos) tr[id].ffn_up = mkweight(ptr,it->second);
             else if (key.find("ffn_down") != string::npos) tr[id].ffn_down = mkweight(ptr,it->second);
             else if (key.find("ffn_gate") != string::npos) tr[id].ffn_gate = mkweight(ptr,it->second);
+        }
+        else if (!key.compare(0,4,"blk.") && key.find("ssm_a") != string::npos) {
+            /* ssm_a has no ".weight" suffix, so the loop above skips it */
+            const int id = atoi(key.c_str()+4);
+            if (id >= 0 && id < n_layers) tr[id].ssm_a = mkweight(ptr,it->second);
         }
         else if (key == TOKENS_EMBED_KEY || key.find("token_embd") != string::npos) {
             if (!t_embed.ptr) t_embed = mkweight(ptr,it->second);
@@ -714,6 +735,24 @@ bool gguf_model::read_qwen3()
         }
     }
     if (q_proj_dim == 0) q_proj_dim = n_heads * head_dim;
+
+    /* qwen35 stacks interleave gated-delta-net linear layers with full attention.
+     * The linear-layer forward is not written yet, so refuse here rather than let
+     * the graph run with unbound linear-layer tensors - which is what produced an
+     * access violation. Everything above is the loader side, ready for it. */
+    if (is_gdn) {
+        int nlin = 0;
+        for (int id = 0; id < n_layers; id++) if (!tr[id].is_full_attn) nlin++;
+        if (nlin > 0) {
+            ERR("'%s' is a hybrid model: %d of %d layers are gated-delta-net linear "
+                "attention and that forward is not implemented yet "
+                "(ssm state=%d inner=%d group=%d vheads=%d conv=%d). Refusing rather "
+                "than running a partial graph. See fast/QWEN35_GDN_DESIGN.md.",
+                arch.c_str(), nlin, n_layers,
+                ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank, ssm_d_conv);
+            return false;
+        }
+    }
 
     assert(supported_rowweight(t_embed.type));
     assert(supported_rowweight(t_out.type));
