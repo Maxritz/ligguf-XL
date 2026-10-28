@@ -421,6 +421,7 @@ bool gguf_model::read_gguf()
     if (arch == "llama" || arch == "qwen" || arch == "qwen2" || arch == "qwen2.5" ||
         arch == "qwen2moe" || arch == "phi3") return read_llama();
     else if (arch == "qwen3" || arch == "qwen35" || arch == "qwen3.5" || arch == "qwen3.8") return read_qwen3();
+    else if (arch == "gpt2") return read_gpt2();
     else if (arch == "bert") return read_bert();
 
     /* These must NOT fall through to read_llama(). They used to be listed there,
@@ -435,9 +436,7 @@ bool gguf_model::read_gguf()
      *                 (key_length/value_length) and
      *                 embedding_length_per_layer_input.
      *   mellum      - attn_q_norm/attn_k_norm plus a 64-expert MoE layout that the
-     *                 llama path would bind to the wrong shapes.
-     *   gpt2        - LayerNorm (not RMS), learned position embeddings, GELU and
-     *                 biases on every projection: a different graph entirely.
+     *                 llama path would bind to the wrong shapes, and YaRN rope.
      *
      * Refusing is the honest behaviour here: a wrong answer is worse than none. */
     ERR("Unsupported architecture '%s' - there is no loader for it. Refusing "
@@ -678,6 +677,112 @@ bool gguf_model::read_qwen3()
         }
     }
     if (q_proj_dim == 0) q_proj_dim = n_heads * head_dim;
+
+    assert(supported_rowweight(t_embed.type));
+    assert(supported_rowweight(t_out.type));
+    return true;
+}
+
+
+/* GPT-2 is a different graph from LLaMA: LayerNorm with bias instead of RMSNorm,
+ * learned absolute position embeddings instead of RoPE, GELU instead of SwiGLU,
+ * and a bias on every projection. Q/K/V live in one fused [Q|K|V] tensor, which
+ * is why the split below mirrors read_llama's. */
+bool gguf_model::read_gpt2()
+{
+    const string p = arch + ".";
+    const char* pfx = p.c_str();
+
+    vocab_size = kv32(p + "vocab_size", 0);
+    n_layers   = kv32(p + "block_count", 0);
+    n_embed    = kv32(p + "embedding_length", 0);
+    n_heads    = kv32(p + "attention.head_count", 0);
+    n_kv_heads = kv32(p + "attention.head_count_kv", n_heads);
+    n_context  = kv32(p + "context_length", 1024);
+    rms_epsilon= kvf32(p + "attention.layer_norm_epsilon", 1e-5f);
+    n_ff       = kv32(p + "feed_forward_length", 0);
+
+    rope_base  = 0.0f; // no RoPE: positions are learned
+    rope_dim   = 0;
+    n_expert   = 0;
+    n_expert_used = 0;
+    has_qgate  = false;
+    is_gpt2    = true;
+
+    if (!n_layers || !n_embed || !n_heads || !n_ff) {
+        ERR("Missing GPT-2 hparams for arch '%s'",pfx);
+        return false;
+    }
+
+    head_dim   = n_embed / n_heads;
+    q_proj_dim = n_heads * head_dim;
+    kv_dim     = n_kv_heads * head_dim;
+
+    tr.resize(n_layers);
+    memset(tr.data(),0,n_layers * sizeof(trans_block));
+
+    for (map<string,gguf_tensor>::const_iterator it = tensors.begin(); it != tensors.end(); ++it) {
+        const string& key = it->first;
+        uint8_t* ptr = tensors_off + it->second.off;
+
+        if (!key.compare(0,4,"blk.") && (key.find(".weight") != string::npos || key.find(".bias") != string::npos)) {
+            int id = atoi(key.c_str()+4);
+            assert(id >= 0 && id < n_layers);
+
+            /* every .bias test must precede the matching .weight substring test */
+            if (key.find("attn_qkv.bias") != string::npos) {
+                tr[id].att_q_bias = (float*)ptr; /* split into K/V biases below */
+            }
+            else if (key.find("attn_qkv") != string::npos) {
+                tr[id].att_q = mkweight(ptr,it->second);
+                tr[id].att_k = tr[id].att_q; /* placeholder, split below */
+                tr[id].att_v = tr[id].att_q;
+            }
+            else if (key.find("attn_norm.bias") != string::npos) tr[id].att_norm_b = (float*)ptr;
+            else if (key.find("attn_norm") != string::npos) tr[id].att_norm = (float*)ptr;
+            else if (key.find("attn_output.bias") != string::npos) tr[id].att_out_bias = (float*)ptr;
+            else if (key.find("attn_output") != string::npos) tr[id].att_out = mkweight(ptr,it->second);
+            else if (key.find("ffn_norm.bias") != string::npos) tr[id].ffn_norm_b = (float*)ptr;
+            else if (key.find("ffn_norm") != string::npos) tr[id].ffn_norm.ptr = ptr;
+            else if (key.find("ffn_up.bias") != string::npos) tr[id].ffn_up_bias = (float*)ptr;
+            else if (key.find("ffn_up") != string::npos) tr[id].ffn_up = mkweight(ptr,it->second);
+            else if (key.find("ffn_down.bias") != string::npos) tr[id].ffn_down_bias = (float*)ptr;
+            else if (key.find("ffn_down") != string::npos) tr[id].ffn_down = mkweight(ptr,it->second);
+        }
+        else if (key.find("token_embd") != string::npos) {
+            t_embed = mkweight(ptr,it->second);
+            if (!vocab_size && it->second.dims.size() > 1) vocab_size = (int)it->second.dims[1];
+        }
+        else if (key.find("position_embd") != string::npos) {
+            t_posemb = mkweight(ptr,it->second);
+            has_pos_embd = true;
+        }
+        else if (key.find("output_norm.bias") != string::npos) t_outnorm_b = (float*)ptr;
+        else if (key.find("output_norm") != string::npos) t_outnorm = (float*)ptr;
+        else if (key.find("output.weight") != string::npos) {
+            t_out = mkweight(ptr,it->second);
+            if (!vocab_size && it->second.dims.size() > 1) vocab_size = (int)it->second.dims[1];
+        }
+    }
+
+    /* Split the fused [Q|K|V] projection and bias into per-part views. */
+    for (int id = 0; id < n_layers; id++) {
+        if (tr[id].att_q.ptr && tr[id].att_k.ptr == tr[id].att_q.ptr && tr[id].att_v.ptr == tr[id].att_q.ptr) {
+            const uint64_t row_bytes = tr[id].att_q.rsz;
+            const int q_width = n_heads * head_dim;
+            tr[id].att_k.ptr = tr[id].att_q.ptr + (uint64_t)q_width * row_bytes;
+            tr[id].att_v.ptr = tr[id].att_k.ptr + (uint64_t)kv_dim  * row_bytes;
+            tr[id].att_k.type = tr[id].att_q.type; tr[id].att_k.rsz = tr[id].att_q.rsz;
+            tr[id].att_v.type = tr[id].att_q.type; tr[id].att_v.rsz = tr[id].att_q.rsz;
+        }
+        if (tr[id].att_q_bias && !tr[id].att_k_bias && !tr[id].att_v_bias) {
+            const int q_width = n_heads * head_dim;
+            tr[id].att_k_bias = tr[id].att_q_bias + q_width;
+            tr[id].att_v_bias = tr[id].att_k_bias + kv_dim;
+        }
+    }
+
+    if (!t_out.ptr) t_out = t_embed; // tied output embeddings
 
     assert(supported_rowweight(t_embed.type));
     assert(supported_rowweight(t_out.type));

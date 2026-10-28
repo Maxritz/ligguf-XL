@@ -54,9 +54,106 @@ static inline void ffn_swiglu(int l)
     }
 }
 
+/* GPT-2 decoder. LayerNorm (with bias) instead of RMSNorm, learned absolute
+ * position embeddings instead of RoPE, GELU instead of SwiGLU, and a bias after
+ * every projection. The KV cache and attention mixing match the LLaMA path. */
+static void inference_gpt2(int tok)
+{
+    const int   ne      = g_m.m.n_embed;
+    const int   ctx_dim = g_m.m.n_heads * g_m.m.head_dim;
+    const int   nrep    = g_m.m.n_heads / g_m.m.n_kv_heads;
+    const float att_scale = 1.0f / sqrtf((float)g_m.m.head_dim);
+    const int   pos     = g_m.pos++;
+
+    viz_begin_frame();
+
+    dequantize_row(g_m.m.t_embed.type,g_m.m.t_embed.ptr + tok * g_m.m.t_embed.rsz,g_m.x.data(),ne);
+    if (g_m.m.has_pos_embd) {
+        const int pr = pos < g_m.m.n_context ? pos : g_m.m.n_context - 1;
+        dequantize_row(g_m.m.t_posemb.type,g_m.m.t_posemb.ptr + (size_t)pr * g_m.m.t_posemb.rsz,g_m.xb.data(),ne);
+        for (int i = 0; i < ne; i++) g_m.x[i] += g_m.xb[i];
+    }
+
+    for (int l = 0; l < g_m.m.n_layers; l++) {
+        STRACE_INFER(l);
+        const trans_block& b = g_m.m.tr[l];
+
+        layernorm(g_m.xb,g_m.x,b.att_norm,b.att_norm_b,ne,g_m.m.rms_epsilon);
+        quantize_q8_K(g_m.xq,g_m.xb);
+        matmul3(g_m.q,g_m.k,g_m.v,&g_m.xb,&g_m.xq,NULL,
+                b.att_q,b.att_k,b.att_v,ne,ctx_dim,g_m.m.kv_dim,g_m.m.kv_dim);
+        if (b.att_q_bias) for (int i = 0; i < ctx_dim;       i++) g_m.q[i] += b.att_q_bias[i];
+        if (b.att_k_bias) for (int i = 0; i < g_m.m.kv_dim;  i++) g_m.k[i] += b.att_k_bias[i];
+        if (b.att_v_bias) for (int i = 0; i < g_m.m.kv_dim;  i++) g_m.v[i] += b.att_v_bias[i];
+
+        const size_t loff = (size_t)l * g_m.m.n_context * g_m.m.kv_dim;
+        f32_to_f16_row(g_m.k.data(),g_m.kc.data() + loff + pos * g_m.m.kv_dim,g_m.m.kv_dim);
+        f32_to_f16_row(g_m.v.data(),g_m.vc.data() + loff + pos * g_m.m.kv_dim,g_m.m.kv_dim);
+
+        MULTITHREAD
+        for (int h = 0; h < g_m.m.n_heads; h++) {
+            STRACE_ATTN(l,h);
+            float* att = g_m.att.data() + h * g_m.m.n_context;
+            float* q   = g_m.q.data() + h * g_m.m.head_dim;
+            float* k   = g_m.k.data() + (h / nrep) * g_m.m.head_dim;
+            float* v   = g_m.v.data() + (h / nrep) * g_m.m.head_dim;
+
+            for (int t = 0; t <= pos; t++) {
+                float score;
+                if (t == pos) {
+                    score = vec_dot_f32(q,k,g_m.m.head_dim);
+                } else {
+                    const gguf_half* kc_row = g_m.kc.data() + loff + t * g_m.m.kv_dim + (h / nrep) * g_m.m.head_dim;
+                    score = vec_dot_f16_f32(kc_row,q,g_m.m.head_dim);
+                }
+                att[t] = score * att_scale;
+            }
+            softmax(att,pos+1);
+
+            float* xb = g_m.xb.data() + h * g_m.m.head_dim;
+            memset(xb,0,g_m.m.head_dim * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                const float a = att[t];
+                if (t == pos) {
+                    for (int i = 0; i < g_m.m.head_dim; i++) xb[i] += a * v[i];
+                } else {
+                    const gguf_half* vc_row = g_m.vc.data() + loff + t * g_m.m.kv_dim + (h / nrep) * g_m.m.head_dim;
+                    for (int i = 0; i < g_m.m.head_dim; i++) xb[i] += a * fp16_to_fp32(vc_row[i]);
+                }
+            }
+        }
+
+        quantize_q8_K(g_m.xq,g_m.xb);
+        matmul(g_m.xb2,&g_m.xb,&g_m.xq,NULL,b.att_out,ctx_dim,ne);
+        if (b.att_out_bias) for (int i = 0; i < ne; i++) g_m.xb2[i] += b.att_out_bias[i];
+        for (int i = 0; i < ne; i++) g_m.x[i] += g_m.xb2[i];
+
+        STRACE_FFN(l);
+        layernorm(g_m.xb,g_m.x,(const float*)b.ffn_norm.ptr,b.ffn_norm_b,ne,g_m.m.rms_epsilon);
+        quantize_q8_K(g_m.xq,g_m.xb);
+        matmul(g_m.hb,&g_m.xb,&g_m.xq,NULL,b.ffn_up,ne,g_m.m.n_ff);
+        if (b.ffn_up_bias) for (int i = 0; i < g_m.m.n_ff; i++) g_m.hb[i] += b.ffn_up_bias[i];
+        gelu(g_m.hb);
+        quantize_q8_K(g_m.xq,g_m.hb);
+        matmul(g_m.xb,&g_m.hb,&g_m.xq,NULL,b.ffn_down,g_m.m.n_ff,ne);
+        if (b.ffn_down_bias) for (int i = 0; i < ne; i++) g_m.xb[i] += b.ffn_down_bias[i];
+        for (int i = 0; i < ne; i++) g_m.x[i] += g_m.xb[i];
+    }
+
+    layernorm(g_m.x,g_m.x,g_m.m.t_outnorm,g_m.m.t_outnorm_b,ne,g_m.m.rms_epsilon);
+    if (g_m.m.t_out.type == Q8_0 || g_m.m.t_out.type == Q1_0 || g_m.m.t_out.type == LQ1_G) {
+        quantize_q8_0(g_m.xq8,g_m.x);
+        matmul(g_m.logits,&g_m.x,NULL,&g_m.xq8,g_m.m.t_out,ne,g_m.m.vocab_size);
+    } else {
+        quantize_q8_K(g_m.xq,g_m.x);
+        matmul(g_m.logits,&g_m.x,&g_m.xq,NULL,g_m.m.t_out,ne,g_m.m.vocab_size);
+    }
+}
+
 void inference(int tok)
 {
     PERF_INFERENCE();
+    if (g_m.m.is_gpt2) { inference_gpt2(tok); return; }
     const float att_scale = 1.0f / sqrtf((float)g_m.m.head_dim);
     const int pos = g_m.pos++;
 

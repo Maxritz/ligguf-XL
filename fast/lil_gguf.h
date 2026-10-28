@@ -277,6 +277,14 @@ struct trans_block {
     wtensor ffn_gate;
     bool ffn_up_fused = false; // Phi-3/Phi-4: gate+up share one [n_embed, 2*n_ff] tensor
 
+    /* GPT-2: LayerNorm and projection biases. RMSNorm architectures leave these
+     * null because every projection is bias-free. */
+    float* att_norm_b = NULL;
+    float* att_out_bias = NULL;
+    float* ffn_norm_b = NULL;
+    float* ffn_up_bias = NULL;
+    float* ffn_down_bias = NULL;
+
     /* MoE (llama/qwen*-moe style). ffn_gate_inp is the router logits. */
     bool is_moe = false;
     wtensor ffn_gate_inp;   // router: [n_embd, n_expert]
@@ -378,6 +386,10 @@ struct gguf_model {
     wtensor t_embed; // token embedding tensor (const)
     wtensor t_out; // output classifier tensor (const)
     float* t_outnorm; // final RMS norm weights (const)
+    wtensor t_posemb; // GPT-2 learned position embeddings (const)
+    bool has_pos_embd = false;
+    float* t_outnorm_b = NULL; // GPT-2 final LayerNorm bias (const)
+    bool is_gpt2 = false; // select the GPT-2 decoder graph
     std::vector<trans_block> tr; // transformer blocks/layers (const)
     wtensor bert_tok_embd; // BERT token embedding tensor (const)
     wtensor bert_pos_embd; // BERT position embedding tensor (const)
@@ -399,6 +411,7 @@ struct gguf_model {
     bool read_gguf();
     bool read_llama();
     bool read_qwen3();
+    bool read_gpt2();
     bool read_bert();
     bool read_arch();     // generic, dimension-driven loader (preferred)
     bool finalize();      // post-load fixups (tied output, validation)

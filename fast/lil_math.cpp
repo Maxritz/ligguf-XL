@@ -1077,7 +1077,8 @@ void layernorm(ftensor &out, const ftensor &x, const float* w, const float* b, i
     var /= size;
 
     const float scale = (float)(1.0 / sqrt(var + epsilon));
-    for (int i = 0; i < size; i++) out[i] = (float)((x[i] - mean) * scale * w[i] + b[i]);
+    for (int i = 0; i < size; i++)
+        out[i] = (float)((x[i] - mean) * scale) * (w ? w[i] : 1.0f) + (b ? b[i] : 0.0f);
 }
 
 void softmax(float* x, int size)
