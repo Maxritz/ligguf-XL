@@ -267,8 +267,11 @@ Visualization build:
 ./ligguf-fast-sdl -m model.gguf -p "Trace this token stream." -n 64 -V
 ```
 
-The FAST engine supports **Q8_0**, **Q1_0**, **Q1_G**, **Q5_0**, **Q5_1**, and the **Qn_K** family from **Q2_K** through **Q6_K**.
-It also understands both classic **LLaMA**-style checkpoints and **Qwen3** models, while a separate **BERT** GGUF can be attached for retrieval memory.
+The FAST engine supports **Q8_0**, **Q1_0**, **Q1_G**, **Q5_0**, **Q5_1**, **IQ4_NL**, **BF16**, and the **Qn_K** family from **Q2_K** through **Q6_K**.
+It also understands **LLaMA**-style checkpoints, **Qwen2/Qwen2.5**, **Qwen2-MoE**, **Qwen3**, **Phi-3/Phi-4**, and **GPT-2**, while a separate **BERT** GGUF can be attached for retrieval memory.
+Architectures without a real loader (currently **gemma2/3/4** and **mellum**) are refused with an error instead of being run through the LLaMA path, which would produce garbage.
+
+Prefill (prompt processing) and token generation are timed and reported separately, and measured numbers live in [fast/BENCH_INFER.md](fast/BENCH_INFER.md).
 
 ---
 
@@ -295,6 +298,9 @@ It also understands both classic **LLaMA**-style checkpoints and **Qwen3** model
 - **No runtime dequantization**: Q5_0/Q5_1 use native AVX2 dot-product kernels that operate directly on quantized data
 - LLaMA-style architecture support
 - **Qwen3** architecture support, including its extra attention normalization path
+- **Phi-3/Phi-4** support, including the fused gate+up feed-forward tensor
+- **GPT-2** support: LayerNorm, learned absolute positions, GELU, and projection biases
+- Separate prefill and token-generation timing
 - **BERT** GGUF loading for embeddings
 - Top-K, Top-P, temperature, and greedy sampling
 - Prompt-file input and saved-state prefill/load workflow
